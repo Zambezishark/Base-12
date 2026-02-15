@@ -155,7 +155,52 @@ USAGE:
       margin-left:auto;
       margin-right:auto;
     }
-    
+    css/* Mobile Responsive Styles - Added for iPhone Portrait Mode */
+@media screen and (max-width: 768px) {
+  body {
+    padding-top: 20px;
+    font-size: 14px;
+    overflow-x: hidden;
+  }
+  
+  #steady-background,
+  #portable-background {
+    background-size: cover !important;
+  }
+  
+  button {
+    min-width: 90% !important;
+    margin: 5px auto !important;
+    padding: 15px !important;
+    font-size: 16px !important;
+    display: block !important;
+  }
+  
+  input, select, textarea {
+    font-size: 16px !important;
+    max-width: 100% !important;
+    box-sizing: border-box;
+  }
+  
+  * {
+    max-width: 100vw !important;
+    box-sizing: border-box;
+  }
+  
+  canvas, svg {
+    max-width: 100% !important;
+    height: auto !important;
+  }
+  
+  h1 { font-size: 22px !important; }
+  h2 { font-size: 18px !important; }
+}
+
+@media screen and (max-width: 480px) {
+  body { font-size: 12px; }
+  h1 { font-size: 18px !important; }
+  button { font-size: 14px !important; padding: 12px !important; }
+}
   </style>
 <!-- External Libraries -->
 <script src="https://cdn.jsdelivr.net/npm/jsmidgen@latest"></script>
