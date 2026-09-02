@@ -1124,8 +1124,11 @@ function toVexKey(tok){
     // Volume update (for Tone.js Sampler)
     function updateVolume(val) {
       volume = val;
+      /* FIX_89: the dial is the MASTER now - it must move every instrument by
+         the same amount, so nothing scales it a second time on its own. */
+      if (typeof window.__setMasterVolume === 'function') window.__setMasterVolume(val);
       if (piano) {
-        piano.volume.value = val - 127;
+        piano.volume.value = -7;
       }
     }
 
@@ -1159,7 +1162,7 @@ function toVexKey(tok){
         release: 1,
         baseUrl: "https://tonejs.github.io/audio/salamander/"
       }).toDestination();
-      piano.volume.value = volume - 127;
+      piano.volume.value = -7;      // FIX_89: the master carries the level
       
       await Tone.loaded();
       
@@ -3117,7 +3120,7 @@ function __trimBase12Terminating(s){
       const volInput=document.getElementById('volumeKnob');
       let bpm = tempoInput ? parseInt(tempoInput.value,10) : (window.currentTempo||180); if(!Number.isFinite(bpm)) bpm=180;
       let vol = volInput ? parseInt(volInput.value,10) : (window.volume||120); if(!Number.isFinite(vol)) vol=120;
-      try{ window.piano.volume.value = vol - 127; }catch(_){}
+      try{ window.piano.volume.value = -7; }catch(_){}   // FIX_89: master carries the level
       await Tone.loaded();
       window._altIsPlaying = true; if(btn) btn.innerText = "⏹ Stop";
 
@@ -6111,6 +6114,7 @@ notes.push(sn);
     }
     repaint();
   }
+  window.__transposeBy = transposeBy;      /* FIX_91: testable, and reusable */
 
   function wire(){
     var btn = document.getElementById('transposeButton');
@@ -7451,6 +7455,15 @@ notes.push(sn);
   // Bars when nothing is harmonised: the melody cut by the meter, with the
   // pickup barred off at the front.
   function barsFromMelody(){
+    /* FIX_93: once the file holds more than one converted pattern the bars
+       no longer come from the live fraction - they come from the materials
+       laid on the score's own timeline. One lever, so every reader of the
+       bar list follows: the engraver, playback, paste and the drum engine. */
+    if (typeof window.__materialBars === 'function'){
+      var mb = null;
+      try { mb = window.__materialBars(); } catch(_){}
+      if (mb && mb.length) return mb;
+    }
     var src = periodNotes();
     if (!src.notes.length) return [];
     var E = 8;
@@ -7634,16 +7647,32 @@ notes.push(sn);
     return out;
   }
 
+  /* FIX_89: the notes are shared out evenly between the systems instead of
+     being packed until a system is full. Twenty-seven notes - a three note
+     pickup and four bars of six - come out fifteen and twelve, not
+     twenty-one and six. */
   function linePlan(chunks){
-    var lines = [], cur = [], slots = 0;
-    chunks.forEach(function(c){
-      if (cur.length && (cur.length >= MAX_BARS_PER_LINE ||
-                         slots + c.n > MAX_NOTES_PER_SYSTEM)){
-        lines.push(cur); cur = []; slots = 0;
+    var total = chunks.reduce(function(a, c){ return a + c.n; }, 0);
+    var S = Math.max(1,
+              Math.ceil(total / MAX_NOTES_PER_SYSTEM),
+              Math.ceil(chunks.length / MAX_BARS_PER_LINE));
+    var lines = [], i = 0, leftNotes = total, leftLines = S;
+
+    while (i < chunks.length){
+      var target = leftNotes / Math.max(1, leftLines);
+      var cur = [], sum = 0;
+      while (i < chunks.length){
+        var n = chunks[i].n;
+        if (chunks.length - i <= Math.max(0, leftLines - 1)) break;   // one left per system
+        if (cur.length && (cur.length >= MAX_BARS_PER_LINE ||
+                           sum + n > MAX_NOTES_PER_SYSTEM)) break;
+        if (cur.length && Math.abs(sum + n - target) > Math.abs(sum - target)) break;
+        cur.push(chunks[i]); sum += n; i++;
       }
-      cur.push(c); slots += c.n;
-    });
-    if (cur.length) lines.push(cur);
+      if (!cur.length){ cur.push(chunks[i]); sum += chunks[i].n; i++; }   // never stall
+      lines.push(cur);
+      leftNotes -= sum; leftLines--;
+    }
     return lines;
   }
 
@@ -7666,6 +7695,10 @@ notes.push(sn);
     if (bar.labelRoot != null && barPcs.indexOf(bar.labelRoot) < 0) barPcs.push(bar.labelRoot);
     if (bar.labelBass != null && barPcs.indexOf(bar.labelBass) < 0) barPcs.push(bar.labelBass);
     staves.forEach(function(st){
+      /* FIX_89: a drum stave carries kit numbers, not pitches. Letting them
+         into the spelling table was pulling the whole bar's accidentals the
+         wrong way once a pattern had been written. */
+      if (st.clef === 'percussion' || st.name === 'Drumset' || st.name === 'Congas') return;
       var ovp = barOverrideFor(st.name, barIndex);
       if (ovp){
         ovp.forEach(function(n){
@@ -7687,10 +7720,10 @@ notes.push(sn);
     var table = spellBar(barPcs, bar.chord);
 
     var parts = staves.map(function(st){
-      var notes, beams = [];
+      var beams = [];
       var __isDrumStave = (st.clef === 'percussion');
-      /* FIX_87: any percussion stave that carries drum cells is engraved by
-         the drum builder, not only the one literally named Drumset */
+      /* a percussion stave that carries drum cells is engraved by the drum
+         builder, not by the pitched path below */
       if (__isDrumStave && typeof window.__buildDrumPart === 'function' &&
           ((window.__drumBarFor && window.__drumBarFor(st.name, barIndex)) ||
            (st.name === 'Drumset' && window.__drumBar && window.__drumBar(barIndex)))){
@@ -7699,157 +7732,152 @@ notes.push(sn);
         if (dp) return dp;
       }
       var ov = barOverrideFor(st.name, barIndex);
+      var firstIdx = 0, items = [];
 
-      /* FIX_87: per-bar clef choice (treble/bass only) and octave conveyors.
-         A note in octaves 0-1 is written an octave up under an 8vb line, a
-         note in octaves 8-9 an octave down under an 8va line. The clef is
-         then chosen per bar: material past the third ledger line below the
-         treble staff (under F3) moves to the bass clef, material past the
-         third ledger line above the bass staff (over G4) moves to the treble. */
-      var useClef = st.clef, ottList = [];
-      function dispOf(m){ if (m < 36) return m + 12; if (m >= 108) return m - 12; return m; }
-      if (!__isDrumStave){
-        var __mids = [];
-        if (ov){
-          var wat = 0;
-          ov.forEach(function(n){
-            var w = (n.sl != null) ? n.sl : slotsOf(n.dur || '8');
-            if (wat >= s0 && wat < s1 && !n.rest && n.midis) n.midis.forEach(function(m){ __mids.push(m); });
-            wat += w;
-          });
-        }
-        else if (st.name === 'Piano RH'){
-          (bar.melody || []).forEach(function(m, i){
-            if (i >= s0 && i < s1 && !isDeleted('Piano RH', barIndex, i)) __mids.push(shifted('Piano RH', barIndex, i, m));
-          });
-        } else {
-          var __v0 = voicedNotes(st.name, bar, barIndex);
-          if (__v0 && !isDeleted(st.name, barIndex, 0)) __v0.forEach(function(m){ __mids.push(shifted(st.name, barIndex, 0, m)); });
-        }
-        var __disp = __mids.map(dispOf);
-        if (__disp.length){
-          var __lo = Math.min.apply(null, __disp), __hi = Math.max.apply(null, __disp);
-          var fitT = (__lo >= 53), fitB = (__hi <= 67);
-          if (fitT) useClef = 'treble';
-          else if (fitB) useClef = 'bass';
-          else useClef = ((__lo + __hi) / 2 >= 60) ? 'treble' : 'bass';
-        }
-      }
-
-      var firstIdx = 0;
-
+      /* ---- 1. what sounds in this measure, in drawing order ---- */
       if (ov){
-        var slice = [], at = 0, seen = false;
+        var at = 0, seen = false;
         ov.forEach(function(n, ni){
           var w = (n.sl != null) ? n.sl : slotsOf(n.dur || '8');
           if (at >= s0 && at < s1){
             if (!seen){ firstIdx = ni; seen = true; }
-            slice.push({ n: n, ni: ni });
+            items.push({
+              rest: !!(n.rest || !n.midis || !n.midis.length),
+              midis: (n.midis || []).slice(),
+              dur: n.dur || '8',
+              src: n
+            });
           }
           at += w;
         });
-        if (!slice.length){
-          notes = [ new VF.StaveNote({ clef: useClef, keys: [ REST_KEY[useClef] || 'b/4' ],
-                                       duration: (slotsToDurs(span)[0] || 'w') + 'r' }) ];
-        } else {
-          notes = slice.map(function(rec, k){
-            var n = rec.n;
-            if (n.rest || !n.midis || !n.midis.length){
-              return new VF.StaveNote({
-                clef: useClef, keys: [ REST_KEY[useClef] || 'b/4' ], duration: (n.dur || '8') + 'r'
-              });
-            }
-            var __ot = 0;
-            var sn = new VF.StaveNote({
-              clef: useClef,
-              keys: n.midis.map(function(m){ var dm = dispOf(m); if (dm > m) __ot = -1; else if (dm < m) __ot = 1; return keyWith(dm, table); }),
-              duration: n.dur || '8'
-            });
-            if (__ot) ottList.push({ ni: k, dir: (__ot > 0 ? 'va' : 'vb') });
-            if (n.acc){
-              try { sn.addArticulation(0, new VF.Articulation('a>').setPosition(3)); } catch(_){}
-            }
-            return sn;
-          });
-          // FIX_86: one chord spelt as more than one note is tied across
-          try {
-            slice.forEach(function(rec, k){
-              var n = rec.n;
-              if (!n.tie || n.tie !== 'start') return;
-              var a2 = notes[k], b2 = notes[k + 1];
-              if (!a2 || !b2) return;
-              var idxs = [];
-              for (var q3 = 0; q3 < (n.midis ? n.midis.length : 1); q3++) idxs.push(q3);
-              beams.push(new VF.StaveTie({
-                first_note: a2, last_note: b2,
-                first_indices: idxs, last_indices: idxs
-              }));
-            });
-          } catch(_){}
-          // FIX_84: a group written as a tuplet gets its bracket
-          try {
-            var tupRuns = {}, tupSpec = {};
-            slice.forEach(function(rec, k){
-              var n = rec.n;
-              if (!n.tup || !n.tup.id) return;
-              (tupRuns[n.tup.id] = tupRuns[n.tup.id] || []).push(notes[k]);
-              tupSpec[n.tup.id] = n.tup;
-            });
-            Object.keys(tupRuns).forEach(function(id){
-              var grp = tupRuns[id], sp = tupSpec[id];
-              if (grp.length < 2) return;
-              beams.push(new VF.Tuplet(grp, {
-                num_notes: sp.n || grp.length,
-                notes_occupied: sp.d || 2,
-                bracketed: true
-              }));
-            });
-          } catch(_){}
-          var beamable = slice.every(function(rec){ return !rec.n.rest && (rec.n.dur || '8') === '8'; });
-          if (notes.length > 1 && beamable){
-            var plan2 = beamPlan(notes.length), at2 = 0;
-            for (var q2 = 0; q2 < plan2.length; q2++){
-              var chunk2 = notes.slice(at2, at2 + plan2[q2]);
-              at2 += plan2[q2];
-              if (chunk2.length > 1) beams.push(new VF.Beam(chunk2));
-            }
-          }
-        }
+        if (!items.length) items.push({ rest:true, midis:[], dur:(slotsToDurs(span)[0] || 'w'), src:null });
       } else if (st.name === 'Piano RH'){
         firstIdx = s0;
-        notes = (bar.melody || []).slice(s0, s1).map(function(m, k){
+        (bar.melody || []).slice(s0, s1).forEach(function(m, k){
           var i = s0 + k;
-          if (isDeleted(st.name, barIndex, i)){
-            return new VF.StaveNote({ clef: useClef, keys: [ REST_KEY[useClef] || 'b/4' ], duration: '8r' });
-          }
-          var __m = shifted(st.name, barIndex, i, m), __dm = dispOf(__m);
-          if (__dm !== __m) ottList.push({ ni: k, dir: (__dm < __m ? 'va' : 'vb') });
-          return new VF.StaveNote({ clef: useClef, keys: [ keyWith(__dm, table) ], duration: '8' });
+          if (isDeleted(st.name, barIndex, i)) items.push({ rest:true, midis:[], dur:'8', src:null });
+          else items.push({ rest:false, midis:[ shifted(st.name, barIndex, i, m) ], dur:'8', src:null });
         });
-        if (!notes.length){
-          notes = [ new VF.StaveNote({ clef: useClef, keys: [ REST_KEY[useClef] || 'b/4' ], duration: 'wr' }) ];
-        } else {
-          var plan = beamPlan(notes.length), at3 = 0;
-          for (var q = 0; q < plan.length; q++){
-            var chunk = notes.slice(at3, at3 + plan[q]);
-            at3 += plan[q];
-            if (chunk.length > 1) beams.push(new VF.Beam(chunk));
-          }
-        }
+        if (!items.length) items.push({ rest:true, midis:[], dur:'w', src:null });
       } else {
         var voiced = voicedNotes(st.name, bar, barIndex);
         if (voiced && s0 === 0 && !isDeleted(st.name, barIndex, 0)){
-          var __ot2 = 0;
-          notes = [ new VF.StaveNote({
-            clef: useClef,
-            keys: voiced.map(function(m){ var mm = shifted(st.name, barIndex, 0, m), dm = dispOf(mm); if (dm > mm) __ot2 = -1; else if (dm < mm) __ot2 = 1; return keyWith(dm, table); }),
-            duration: chordDuration(span)
-          }) ];
-          if (__ot2) ottList.push({ ni: 0, dir: (__ot2 > 0 ? 'va' : 'vb') });
+          items.push({ rest:false,
+            midis: voiced.map(function(m){ return shifted(st.name, barIndex, 0, m); }),
+            dur: chordDuration(span), src:null });
         } else {
-          notes = [ new VF.StaveNote({
-            clef: useClef, keys: [ REST_KEY[useClef] || 'b/4' ], duration: 'wr'
-          }) ];
+          items.push({ rest:true, midis:[], dur:'w', src:null });
+        }
+      }
+
+      /* ---- 2. the clef, from the sounding pitches ----
+         Treble unless the measure drops past the third ledger line below it
+         (under F3), bass unless it rises past the third ledger line above it
+         (over G4). Only these two clefs are ever used. */
+      var useClef = st.clef;
+      if (!__isDrumStave){
+        var all = [];
+        items.forEach(function(it){ if (!it.rest) all = all.concat(it.midis); });
+        if (all.length){
+          var lo0 = Math.min.apply(null, all), hi0 = Math.max.apply(null, all);
+          if (lo0 >= 53) useClef = 'treble';
+          else if (hi0 <= 67) useClef = 'bass';
+          else useClef = ((lo0 + hi0) / 2 >= 60) ? 'treble' : 'bass';
+        }
+      }
+
+      /* ---- 3. FIX_90: the octave conveyors, measured against THAT staff ----
+         Anything from the fourth ledger line outward is written an octave in
+         and carries 8va or 8vb. The old rule counted absolute octaves, so a
+         passage six ledger lines above the treble staff was left standing
+         there unconveyed. Whatever lies between the first and the last
+         conveyed note travels with them, so one unbroken line covers the
+         whole passage. */
+      var HI = (useClef === 'bass') ? 71 : 91;    // B4 over bass, G6 over treble
+      var LO = (useClef === 'bass') ? 29 : 50;    // F1 under bass, D3 under treble
+      var oct = items.map(function(it){
+        if (__isDrumStave || it.rest || !it.midis.length) return 0;
+        if (Math.max.apply(null, it.midis) >= HI) return -1;
+        if (Math.min.apply(null, it.midis) <= LO) return 1;
+        return 0;
+      });
+      [-1, 1].forEach(function(dir){
+        var f = -1, l = -1;
+        oct.forEach(function(v, i){ if (v === dir){ if (f < 0) f = i; l = i; } });
+        if (f < 0) return;
+        for (var i2 = f; i2 <= l; i2++) if (!items[i2].rest && oct[i2] === 0) oct[i2] = dir;
+      });
+
+      /* ---- 4. the notes ---- */
+      var ottList = [];
+      var notes = items.map(function(it, i){
+        if (it.rest){
+          return new VF.StaveNote({
+            clef: useClef, keys: [ REST_KEY[useClef] || 'b/4' ], duration: (it.dur || '8') + 'r'
+          });
+        }
+        var k = oct[i] | 0;
+        if (k) ottList.push({ ni: i, dir: (k < 0 ? 'va' : 'vb') });
+        var sn = new VF.StaveNote({
+          clef: useClef,
+          keys: it.midis.map(function(m){ return keyWith(m + 12 * k, table); }),
+          duration: it.dur || '8'
+        });
+        if (it.src && it.src.acc){
+          try { sn.addArticulation(0, new VF.Articulation('a>').setPosition(3)); } catch(_){}
+        }
+        return sn;
+      });
+
+      /* ---- 5. ties, tuplets, beams ---- */
+      try {
+        items.forEach(function(it, k2){
+          var n = it.src;
+          if (!n || n.tie !== 'start') return;
+          var a2 = notes[k2], b2 = notes[k2 + 1];
+          if (!a2) return;
+          var idxs = [];
+          for (var q3 = 0; q3 < (n.midis ? n.midis.length : 1); q3++) idxs.push(q3);
+          if (!b2){
+            /* FIX_93: the tie runs over the barline - the note it joins is in
+               the next measure, so what is drawn here is the half of the tie
+               that leaves this one. */
+            try {
+              beams.push(new VF.StaveTie({
+                first_note: a2, last_note: null, first_indices: idxs, last_indices: idxs
+              }));
+            } catch(_){}
+            return;
+          }
+          beams.push(new VF.StaveTie({
+            first_note: a2, last_note: b2, first_indices: idxs, last_indices: idxs
+          }));
+        });
+      } catch(_){}
+      try {
+        var tupRuns = {}, tupSpec = {};
+        items.forEach(function(it, k3){
+          var n = it.src;
+          if (!n || !n.tup || !n.tup.id) return;
+          (tupRuns[n.tup.id] = tupRuns[n.tup.id] || []).push(notes[k3]);
+          tupSpec[n.tup.id] = n.tup;
+        });
+        Object.keys(tupRuns).forEach(function(id){
+          var grp = tupRuns[id], sp = tupSpec[id];
+          if (grp.length < 2) return;
+          beams.push(new VF.Tuplet(grp, {
+            num_notes: sp.n || grp.length, notes_occupied: sp.d || 2, bracketed: true
+          }));
+        });
+      } catch(_){}
+
+      var beamable = notes.length > 1 && items.every(function(it){ return !it.rest && (it.dur || '8') === '8'; });
+      if (beamable){
+        var plan = beamPlan(notes.length), atb = 0;
+        for (var q = 0; q < plan.length; q++){
+          var chunk = notes.slice(atb, atb + plan[q]);
+          atb += plan[q];
+          if (chunk.length > 1) beams.push(new VF.Beam(chunk));
         }
       }
 
@@ -7860,7 +7888,6 @@ notes.push(sn);
       return { stave: st, notes: notes, beams: beams, voice: voice,
                clefUse: useClef, ott: ottList, firstIdx: firstIdx };
     });
-
     return { bar: bar, table: table, parts: parts, s0: s0, s1: s1 };
   }
 
@@ -8334,8 +8361,8 @@ notes.push(sn);
   var SAMPLE_HOST_INDEX = 0;
   function sampleBase(){ return SAMPLE_HOSTS[SAMPLE_HOST_INDEX] || SAMPLE_HOSTS[0]; }
   var SAMPLE_SETS = {
-    'contrabass':      { notes: ['Fs1','G1','As1','C2','D2','E2','Fs2','Gs2','A2','E3'], gain: 4 },
-    'bass-electric':   { notes: ['Cs1','E1','G1','As1','Cs2','E2','G2','As2','Cs3','E3','G3'], gain: 2 },
+    'contrabass':      { notes: ['Fs1','G1','As1','C2','D2','E2','Fs2','Gs2','A2','E3'], gain: -0.44 },   /* FIX_91: 60% of the old default (4 dB - 4.44 dB) */
+    'bass-electric':   { notes: ['Cs1','E1','G1','As1','Cs2','E2','G2','As2','Cs3','E3','G3'], gain: -2.44 },  /* FIX_91: 60% of the old default (2 dB - 4.44 dB) */
     'cello':           { notes: ['C2','E2','G2','As2','C3','E3','G3','As3','C4','E4','G4','C5'], gain: 0 },
     'violin':          { notes: ['G3','A3','C4','E4','G4','A4','C5','E5','G5','A5','C6'], gain: -2 },
     'flute':           { notes: ['C4','E4','A4','C5','E5','A5','C6','A6'], gain: -2 },
@@ -8633,13 +8660,50 @@ notes.push(sn);
              one strike, held for the combined length, instead of two hits */
           var at = 0, wArr = ov.map(function(n){ return (n.sl != null) ? n.sl : slotsOf(n.dur || '8'); });
           var skip = {};
+
+          /* FIX_93: a tie that runs over a barline is one held note too. The
+             re-barring splits a note wherever the barline falls, so without
+             this the sound would change every time the metre did. */
+          function seqAt(gi){ return barOverrideFor(st.name, gi) || null; }
+          function widthOf(n){ return (n.sl != null) ? n.sl : slotsOf(n.dur || '8'); }
+          function sounds(n){ return !!(n && !n.rest && n.midis && n.midis.length); }
+
+          // how many notes at the head of this bar are already sounding,
+          // carried in by a tie from the bar before
+          var carried = 0;
+          (function(){
+            var prev = seqAt(g - 1);
+            if (!prev || !prev.length) return;
+            if (prev[prev.length - 1].tie !== 'start') return;
+            var k = 0;
+            while (k < ov.length && sounds(ov[k])){
+              carried++;
+              if (ov[k].tie !== 'start') break;
+              k++;
+            }
+          })();
+
           ov.forEach(function(n, i){
             var w = wArr[i];
-            if (!skip[i] && !n.rest && n.midis && n.midis.length){
+            if (i >= carried && !skip[i] && sounds(n)){
               var hold = w, j = i;
-              while (ov[j] && ov[j].tie === 'start' && ov[j + 1] && !ov[j + 1].rest &&
-                     ov[j + 1].midis && ov[j + 1].midis.length){
+              while (ov[j] && ov[j].tie === 'start' && sounds(ov[j + 1])){
                 j++; skip[j] = true; hold += wArr[j];
+              }
+              // and on into the bars that follow, while the tie holds
+              if (ov[j] && ov[j].tie === 'start' && j === ov.length - 1){
+                var gi = g + 1, guard = 0;
+                while (guard++ < 64){
+                  var nxt = seqAt(gi);
+                  if (!nxt || !nxt.length || !sounds(nxt[0])) break;
+                  var q = 0;
+                  hold += widthOf(nxt[0]);
+                  while (nxt[q] && nxt[q].tie === 'start' && sounds(nxt[q + 1])){
+                    q++; hold += widthOf(nxt[q]);
+                  }
+                  if (!(nxt[q] && nxt[q].tie === 'start' && q === nxt.length - 1)) break;
+                  gi++;
+                }
               }
               put(at, st.program | 0, n.midis.map(noteToken), hold);
             }
@@ -8709,6 +8773,11 @@ notes.push(sn);
         if (btn) btn.innerText = '\u25b6\ufe0f Play';
         return;
       }
+      /* FIX_92: the transport counts one event to a slot, so anything finer
+         than a slot - a sixteenth in a drum groove written over eighths -
+         had nowhere to sound. A slot hook lets a feature place its own
+         off-slot strokes inside the slot that is playing. */
+      try { if (typeof window.__slotHook === 'function') window.__slotHook(idx, delay); } catch(_){}
       window.__playLive = idx;
       try { if (typeof window.__playheadTo === 'function') window.__playheadTo(idx); } catch(_){}
       idx++;
@@ -9020,9 +9089,9 @@ notes.push(sn);
   var MENU = [
     { title: 'FILE', items: [
       { label: 'New',          act: function(){ location.reload(); } },
-      { label: 'Load',         todo: true },
-      { label: 'Save',         todo: true },
-      { label: 'Save as',      todo: true },
+      { label: 'Load',         act: function(){ if (window.__b12Load) window.__b12Load(); } },
+      { label: 'Save',         act: function(){ if (window.__b12Save) window.__b12Save(); } },
+      { label: 'Save as',      act: function(){ if (window.__b12SaveAs) window.__b12SaveAs(); } },
       { label: 'Export midi',  sub: [
         { label: 'Current fraction',                      act: press('dlCurrentFraction') },
         { label: 'All fractions within this denominator', act: press('dlAllFractions') },
@@ -9031,7 +9100,7 @@ notes.push(sn);
       ]},
       { label: 'Export audio', act: press('exportMp3Button') },
       { label: 'Print',        act: function(){ window.print(); } },
-      { label: 'About', todo: true },
+      { label: 'About', act: function(){ if (window.__b12About) window.__b12About(); } },
       { label: 'Quit',  todo: true }
     ]},
 
@@ -9056,6 +9125,8 @@ notes.push(sn);
         { label: 'Invert',               act: press('transformInvert') },
         { label: 'Retrograde',           act: press('transformRetrograde') },
         { label: 'Retrograde inversion', act: press('transformRetrogradeInversion') },
+        { label: 'Augmentation',         act: function(){ if (window.__augmentation) window.__augmentation(); } },
+        { label: 'Diminution',           act: function(){ if (window.__diminution) window.__diminution(); } },
         { label: 'Revert',               act: press('transformRevert') }
       ]},
       { label: 'Transpose', act: press('transposeButton') }
@@ -9550,10 +9621,10 @@ notes.push(sn);
     var instruments = newButton('instrumentsButton', 'Instruments');
     put(compose.__grid, instruments);
 
-    var arrange = newButton('arrangeButton', 'Arrange \u25bc');
+    var arrange = newButton('arrangeButton', 'BASS \u25bc');        /* FIX_94 */
     put(compose.__grid, arrange);
 
-    var create = newButton('createButton', 'Create \u25bc');
+    var create = newButton('createButton', 'Template \u25bc');      /* FIX_94 */
     put(compose.__grid, create);
 
     var drums = newButton('drumPatternButton', 'Drum Pattern');
@@ -9637,7 +9708,7 @@ notes.push(sn);
     'Soprano Sax':'treble', 'Alto Sax':'treble', 'Tenor Sax':'treble', 'Baritone Sax':'treble',
     'Trumpet':'treble', 'Flugelhorn':'treble', 'French Horn':'treble',
     'Trombone':'bass', 'Bass Trombone':'bass', 'Tuba':'bass',
-    'Drumset':'percussion', 'Percussion (misc)':'percussion', 'Timpani':'bass',
+    'Drumset':'percussion', 'Percussion (misc)':'percussion', 'Congas':'percussion', 'Timpani':'bass',
     'Glockenspiel':'treble', 'Vibraphone':'treble', 'Marimba':'treble',
     'Xylophone':'treble', 'Tubular Bells':'treble',
     'Harp':'treble', 'Guitar':'treble',
@@ -9668,7 +9739,7 @@ notes.push(sn);
     'Soprano Sax':64, 'Alto Sax':65, 'Tenor Sax':66, 'Baritone Sax':67,
     'Trumpet':56, 'Flugelhorn':56, 'French Horn':60, 'Trombone':57,
     'Bass Trombone':57, 'Tuba':58,
-    'Drumset':128, 'Percussion (misc)':128, 'Timpani':47, 'Glockenspiel':9,
+    'Drumset':128, 'Percussion (misc)':128, 'Congas':128, 'Timpani':47, 'Glockenspiel':9,
     'Vibraphone':11, 'Marimba':12, 'Xylophone':13, 'Tubular Bells':14,
     'Harp':46, 'Guitar':24,
     'Violin I':40, 'Violin II':40, 'Viola':41, 'Violoncello':42,
@@ -9784,9 +9855,12 @@ notes.push(sn);
 
   function del(){
     if (!pickRight.length) return;
-    var keep = draft.filter(function(s, i){
-      return pickRight.indexOf(i) < 0 || s.name === 'Piano RH';           // the pattern lives there
-    });
+    /* FIX_92: the right hand can be taken off the score like any other
+       staff. The pattern itself is not stored in the staff, so nothing is
+       lost by removing it - only the last staff of all is kept, since a
+       score with no staves cannot be drawn. */
+    var keep = draft.filter(function(s, i){ return pickRight.indexOf(i) < 0; });
+    if (!keep.length) return;
     draft = keep;
     pickRight = draft.length ? [Math.min(pickRight[0], draft.length - 1)] : [];
     renderRight();
@@ -9809,7 +9883,14 @@ notes.push(sn);
   function commit(){
     var before = (window.__scoreStaves || []).map(function(s){ return s.name; });
     window.__scoreStaves = draft.map(function(s){
-      return { name: s.name, clef: s.clef, program: s.program };
+      /* FIX_94: a drum staff is pinned to the kit. Rebuilding the list from
+         the dialog was the moment a percussion staff could come back as a
+         melodic one, and the MIDI drumset went with it. */
+      var drum = (s.clef === 'percussion') || (s.name === 'Drumset') ||
+                 (s.name === 'Congas') || (s.name === 'Percussion (misc)');
+      return { name: s.name,
+               clef: drum ? 'percussion' : s.clef,
+               program: drum ? 128 : s.program };
     });
     var names = window.__scoreStaves.map(function(s){ return s.name; });
 
@@ -10248,9 +10329,26 @@ notes.push(sn);
   window.__paintSelection = paint;
   window.__clearSelection = function(){ window.__selection = []; lastIdx = null; paint(); };
 
+  /* FIX_91: a staff whose notes live in a bar override - the bass line the
+     chord progression writes, a rhythmised bar, a pasted passage - was never
+     moved by a transposition, because the note-shift table is only read on
+     the paths that build their notes from the melody. Those notes are now
+     moved in the override itself, so the staff sounds and reads transposed.
+     Percussion is left where it is. */
   window.__shiftSelection = function(k){
     window.__noteShift = window.__noteShift || {};
+    var isDrum = {};
+    (window.__scoreStaves || []).forEach(function(st){
+      if (st.clef === 'percussion' || st.name === 'Drumset' || st.name === 'Congas') isDrum[st.name] = true;
+    });
     window.__selection.forEach(function(s){
+      if (isDrum[s.stave]) return;
+      var ov = window.__barOverride && window.__barOverride[s.stave + '|' + s.bar];
+      var n = ov && ov[s.note];
+      if (n && !n.rest && n.midis && n.midis.length){
+        n.midis = n.midis.map(function(m){ return m + k; });
+        return;
+      }
       var key = s.stave + '|' + s.bar + '|' + s.note;
       window.__noteShift[key] = (window.__noteShift[key] || 0) + k;
     });
@@ -10500,8 +10598,16 @@ notes.push(sn);
     var out = [];
     try {
       if (entry.stave === 'Piano RH'){
-        var mel = bars ? (bars[entry.bar] || {}).melody : null;
-        if (!mel && window.__playMap) mel = null;
+        /* FIX_92: an unharmonised score has no chord list, and this was the
+           only place the right hand's own notes were read from - so copying
+           a plain converted pattern picked up nothing at all, and there was
+           then nothing to paste onto a bass or any other staff. The current
+           bars are the right source whether the score is harmonised or not. */
+        var src = bars;
+        if (!src){
+          try { src = (typeof window.__currentBars === 'function') ? window.__currentBars() : null; } catch(_){ src = null; }
+        }
+        var mel = src ? (src[entry.bar] || {}).melody : null;
         if (mel && mel[entry.note] != null) out = [mel[entry.note]];
       } else if (entry.stave === 'Piano LH' && bars){
         out = ((bars[entry.bar] || {}).midi || []).slice();
@@ -10970,8 +11076,7 @@ notes.push(sn);
     if (!menu || !btn || menu.__bassHook) return;
     menu.innerHTML = '';
 
-    [{ label: 'Extract bass', act: extractBass },
-     { label: 'More options to be defined', todo: true }].forEach(function(it, i){
+    [{ label: 'Extract from Piano LH', act: extractBass }]      /* FIX_94 */.forEach(function(it, i){
       var b = document.createElement('button');
       b.type = 'button';
       b.textContent = it.label;
@@ -13905,8 +14010,8 @@ notes.push(sn);
     if (p >= 8  && p <= 15) return { osc:'sine',     a:0.001, d:0.6,  s:0.05, r:0.8, gain:-8,  cut:6000 };
     if (p >= 16 && p <= 23) return { osc:'sine',     a:0.02,  d:0.1,  s:0.9,  r:0.3, gain:-10, cut:5000 };
     if (p >= 24 && p <= 31) return { osc:'triangle', a:0.005, d:0.35, s:0.15, r:0.5, gain:-8,  cut:4000 };
-    if ((p >= 32 && p <= 39) || p === 43)
-                            return { osc:'sawtooth', a:0.006, d:0.25, s:0.55, r:0.35, gain:2,  cut:900  };
+    if ((p >= 32 && p <= 39) || p === 43)      /* FIX_91: both basses at 60% */
+                            return { osc:'sawtooth', a:0.006, d:0.25, s:0.55, r:0.35, gain:-2.44, cut:900  };
     if (p >= 40 && p <= 51) return { osc:'sawtooth', a:0.09,  d:0.2,  s:0.8,  r:0.5, gain:-16, cut:3000 };
     if (p >= 52 && p <= 55) return { osc:'sine',     a:0.08,  d:0.2,  s:0.85, r:0.6, gain:-12, cut:4000 };
     if (p >= 56 && p <= 63) return { osc:'sawtooth', a:0.04,  d:0.15, s:0.75, r:0.3, gain:-16, cut:3500 };
@@ -15472,6 +15577,30 @@ notes.push(sn);
   }
 
   /* ================================================================
+     FIX_91: MUSICAL TIME, NOT SLOTS
+     The score counts in slots, and a slot is not always an eighth: a
+     chord progression written in half-note triplets counts the bar in
+     sixteenths, so a 4/4 bar holds sixteen slots, not eight. The drum
+     engine read those slots as eighths and built its groove on a grid
+     twice as fine as the music - which is how a 4/4 bar came out as
+     six groups of two eighths. Everything below counts in real
+     sixteenths, and converts to slots only where the score needs it.
+     ================================================================ */
+  function slotEighths(){
+    var u = window.__slotUnit;
+    return (typeof u === 'number' && u > 0) ? u : 1;      // eighths in one slot
+  }
+  function bar16(i){                                       // sixteenths in a bar
+    return Math.max(1, Math.round(barSlots(i) * slotEighths() * 2));
+  }
+  function barBase16(i){
+    var n = 0;
+    for (var k = 0; k < i; k++) n += bar16(k);
+    return n;
+  }
+  window.__bar16 = bar16;
+
+  /* ================================================================
      1. THE SCORE ENGRAVER DRAWS EVERYTHING
      ================================================================ */
   (function routeEngraver(){
@@ -15496,7 +15625,12 @@ notes.push(sn);
      2. THE MELODY RULES
      ================================================================ */
   var NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-  var LOW = 36, HIGH = 96;                 // C2 - C7, the working register
+  /* FIX_92: C8 is a hard ceiling and F#3 a floor, and the ceiling now ranks
+     with the identical-period rule - nothing sounds or is written above it,
+     ever. The pattern is placed as a whole first; a pattern that climbs out
+     of the window over its periods is carried down period by period; and a
+     last pass guarantees the ceiling note by note, whatever came before. */
+  var LOW = 54, HIGH = 108;                // F#3 - C8
 
   function periodInfo(){
     var P = 0, pre = 0;
@@ -15534,52 +15668,111 @@ notes.push(sn);
     if (P > 0 && pre + P <= midi.length){
       // the pickup keeps its own steps
       for (var k = 0; k < pre && k < d.length; k++) out.push(out[k] + d[k]);
+
       // ONE canonical period, then every later period repeats it exactly
       var D = [];
       for (var j = 0; j < P; j++){
         var at = pre + j;
         D.push(at < d.length ? d[at] : 0);
       }
+      // the shape of the period, measured from its own first note
+      var contour = [0];
+      for (var j2 = 0; j2 + 1 < P; j2++) contour.push(contour[j2] + D[j2]);
+
+      /* FIX_90: the PERIOD TRANSPOSITION - the step from one period's first
+         note to the next one's - is taken in its smaller inversion, so ten
+         semitones up is read as two down. The periods are then joined by the
+         smallest interval there is, on the staff and in the playback alike. */
+      var Traw = 0;
+      for (var j3 = 0; j3 < P; j3++) Traw += D[j3];
+      var T = narrow(((Traw % 12) + 12) % 12);
+      window.__periodTransposition = T;
+
+      var head = out[pre] != null ? out[pre] : out[out.length - 1];
       for (var n = out.length; n < midi.length; n++){
-        var step = D[(n - 1 - pre + P * 1000) % P];
-        out.push(out[n-1] + step);
+        var off = n - pre;
+        var kper = Math.floor(off / P), jin = off % P;
+        out.push(head + kper * T + contour[jin]);
+      }
+      // and the first period is written from the same shape, so all of them
+      // are one and the same period
+      for (var n2 = pre; n2 < Math.min(pre + P, midi.length); n2++){
+        out[n2] = head + contour[n2 - pre];
       }
     } else {
       for (var q = 0; q + 1 < midi.length; q++) out.push(out[q] + d[q]);
     }
 
-    /* Register. Only WHOLE periods move, and every period from the shift
-       point on moves with it, so the chain of periods keeps its own
-       transposition and each period stays identical to the others. */
+    /* Register. The whole pattern moves together first: while anything sits
+       above C8 everything comes down an octave, and it goes up again only
+       while that keeps the ceiling. */
+    function bounds(from, to){
+      var lo = Infinity, hi = -Infinity;
+      for (var i2 = from; i2 < to; i2++){
+        if (out[i2] < lo) lo = out[i2];
+        if (out[i2] > hi) hi = out[i2];
+      }
+      return { lo: lo, hi: hi };
+    }
+    function moveAll(from, to, k){ for (var i3 = from; i3 < to; i3++) out[i3] += k; }
+
+    var b = bounds(0, out.length), guard = 0;
+    while (b.hi > HIGH && guard++ < 20){ moveAll(0, out.length, -12); b = bounds(0, out.length); }
+    guard = 0;
+    while (b.lo < LOW && b.hi + 12 <= HIGH && guard++ < 20){
+      moveAll(0, out.length, 12); b = bounds(0, out.length);
+    }
+
+    /* A pattern whose periods climb - the period transposition is small but
+       it is not nothing - walks out of the window sooner or later. Whole
+       PERIODS are then carried by octaves, never single notes, so the shape
+       of every period survives; only the step between two of them takes the
+       octave. */
     if (P > 0){
       var carry = 0, firstCarry = null;
-      for (var s = pre; s < out.length; s += P){
-        var stop = Math.min(s + P, out.length);
-        var lo = Infinity, hi = -Infinity;
-        for (var t = s; t < stop; t++){
-          var v = out[t] + carry;
-          if (v < lo) lo = v;
-          if (v > hi) hi = v;
+      for (var s2 = pre; s2 < out.length; s2 += P){
+        var stop = Math.min(s2 + P, out.length);
+        var lo2 = Infinity, hi2 = -Infinity;
+        for (var t = s2; t < stop; t++){
+          if (out[t] < lo2) lo2 = out[t];
+          if (out[t] > hi2) hi2 = out[t];
         }
-        var guard = 0;
-        while (lo < LOW && guard++ < 12){ carry += 12; lo += 12; hi += 12; }
-        guard = 0;
-        while (hi > HIGH && guard++ < 12){ carry -= 12; lo -= 12; hi -= 12; }
+        var g2 = 0;
+        while (hi2 + carry > HIGH && g2++ < 20) carry -= 12;
+        g2 = 0;
+        while (lo2 + carry < LOW && hi2 + carry + 12 <= HIGH && g2++ < 20) carry += 12;
         if (firstCarry == null) firstCarry = carry;
-        for (var u = s; u < stop; u++) out[u] += carry;
+        for (var u2 = s2; u2 < stop; u2++) out[u2] += carry;
       }
-      // the pickup rides with the period it leads into
       if (firstCarry) for (var w = 0; w < pre && w < out.length; w++) out[w] += firstCarry;
     }
 
+    // and the ceiling holds note by note, whatever else had to give way
     return out.map(function(m, n){
-      while (m < 12) m += 12;
-      while (m > 120) m -= 12;
+      while (m > HIGH) m -= 12;
+      while (m < LOW && m + 12 <= HIGH) m += 12;
       if (m === seq[n].midi) return seq[n];
       var pc = ((m % 12) + 12) % 12;
       return { midi: m, pc: pc, name: NAMES[pc], octave: Math.floor(m / 12) - 1 };
     });
   }
+
+  /* nothing leaves this function above C8, on any path */
+  function ceiling(seq){
+    if (!seq || !seq.length) return seq;
+    var hi = -Infinity;
+    seq.forEach(function(o){ if (o.midi > hi) hi = o.midi; });
+    var k = 0;
+    while (hi + k > HIGH && k > -60) k -= 12;
+    if (!k) return seq;
+    return seq.map(function(o){
+      var m = o.midi + k;
+      while (m > HIGH) m -= 12;
+      var pc = ((m % 12) + 12) % 12;
+      return { midi: m, pc: pc, name: NAMES[pc], octave: Math.floor(m / 12) - 1 };
+    });
+  }
+  window.__ceilingClamp = ceiling;
 
   window.__periodAmbitus = function(){
     try {
@@ -15600,8 +15793,8 @@ notes.push(sn);
       if (typeof orig !== 'function' || orig.__periodWrapped) return;
       var w = function(){
         var seq = orig.apply(this, arguments) || [];
-        if (window.__periodRulesOff || window.altModeActive) return seq;
-        try { return rebuild(seq); } catch(e){ console.warn('period rules', e); return seq; }
+        if (window.__periodRulesOff || window.altModeActive) return ceiling(seq);
+        try { return rebuild(seq); } catch(e){ console.warn('period rules', e); return ceiling(seq); }
       };
       w.__periodWrapped = true;
       w.__ambitusWrapped = true;
@@ -15768,8 +15961,14 @@ notes.push(sn);
 
   /* ---------------- rhythmic groups ---------------- */
   // fours and threes, fours first: 5 -> 3,2   7 -> 4,3   11 -> 4,4,3
-  function defaultGroups(n){
+  function defaultGroups(n, den){
     n = n | 0;
+    /* a compound meter counts in threes: 6/8 is 3+3, 9/8 is 3+3+3 */
+    if (den === 8 && n % 3 === 0 && n >= 6){
+      var t = [];
+      for (var q = 0; q < n / 3; q++) t.push(3);
+      return t;
+    }
     if (n <= 4) return [n > 0 ? n : 4];
     var out = [], r = n;
     while (r > 4){ out.push(4); r -= 4; }
@@ -15915,20 +16114,39 @@ notes.push(sn);
     }
   }
 
+  /* FIX_92: one event to a slot is all the transport plays, so a sixteenth
+     written inside an eighth was heard on the beat or not at all. The strokes
+     that fall on the slot itself go into the bar override as before; the ones
+     that fall later inside it are kept apart, with their position in the slot,
+     and the slot hook fires them at the right moment. */
+  window.__drumLate = window.__drumLate || {};
+
   function writePlayback(name, bar, cells){
-    var slots = barSlots(bar), out = [];
+    var slots = barSlots(bar), out = [], se = slotEighths();
+    var late = {};
     for (var i = 0; i < slots; i++){
-      var midis = [];
-      for (var j = i * 2; j < i * 2 + 2 && j < cells.length; j++){
+      var midis = [], onCell = Math.round(i * se * 2);
+      var from = onCell, to = Math.round((i + 1) * se * 2);
+      if (to <= from) to = from + 1;
+      for (var j = from; j < to && j < cells.length; j++){
+        var frac = (j - from) / (to - from);
         (cells[j] || []).forEach(function(p){
           var m = PIECES[p] && PIECES[p].midi;
-          if (m != null && midis.indexOf(m) < 0) midis.push(m);
+          if (m == null) return;
+          if (frac < 0.001){
+            if (midis.indexOf(m) < 0) midis.push(m);
+          } else {
+            (late[i] = late[i] || []).push({ piece: p, at: frac });
+          }
         });
       }
+      midis.sort(function(a, b){ return a - b; });
       out.push(midis.length ? { midis:midis, dur:'8' } : { rest:true, dur:'8' });
     }
     window.__barOverride = window.__barOverride || {};
     window.__barOverride[name + '|' + bar] = out;
+    if (Object.keys(late).length) window.__drumLate[name + '|' + bar] = late;
+    else delete window.__drumLate[name + '|' + bar];
   }
   function refreshPlayback(name, bar){
     var c = cellsFor(name, bar);
@@ -15943,11 +16161,12 @@ notes.push(sn);
   window.__buildDrumPart = function(VF, st, barIndex, from16, to16){
     var cells = cellsFor(st.name, barIndex);
     if (!cells) return null;
-    var full = barSlots(barIndex) * 2;
-    if (from16 == null) from16 = 0;
-    if (to16 == null) to16 = full;
-    from16 = Math.max(0, from16 | 0);
-    to16 = Math.min(full, to16 | 0);
+    /* the engraver hands over half-slots; the cells are real sixteenths */
+    var se = slotEighths(), full = bar16(barIndex);
+    from16 = (from16 == null) ? 0 : Math.round(from16 * se);
+    to16   = (to16   == null) ? full : Math.round(to16 * se);
+    from16 = Math.max(0, from16);
+    to16 = Math.min(full, to16);
     if (to16 <= from16) return null;
 
     var key = st.name + '|' + barIndex;
@@ -15999,7 +16218,7 @@ notes.push(sn);
       beams = beams.concat(VF.Beam.generateBeams(lo, { beam_rests:false, stem_direction:-1 }));
     } catch(_){}
 
-    var span = Math.max(1, Math.round((to16 - from16) / 2));
+    var span = Math.max(1, Math.round((to16 - from16) / 2));   // musical eighths
     function voiceOf(notes){
       var v = new VF.Voice({ num_beats: span, beat_value:8 });
       v.setMode(VF.Voice.Mode.SOFT);
@@ -16032,35 +16251,146 @@ notes.push(sn);
       if (at + w > to) to = at + w;
     });
     if (!isFinite(from)) return null;
-    return { from: Math.round(from), to: Math.round(to) };
+    var se = slotEighths();
+    return { from: Math.round(from * se * 2), to: Math.round(to * se * 2) };   // sixteenths
   }
 
-  function totalSlots(){
+  function total16(){
     var b = bars(), n = 0;
-    for (var i = 0; i < b.length; i++) n += barSlots(i);
+    for (var i = 0; i < b.length; i++) n += bar16(i);
     return n;
   }
 
-  function applyPattern(style, len, groups, name){
+  /* ================================================================
+     FIX_91: THE PROJECT TIME SIGNATURE COMES FIRST
+     A feature whose grid disagrees with the project's own signature
+     asks before it changes anything. Said no, it lays its rhythm over
+     the bar exactly as the project counts it.
+     ================================================================ */
+  function deriveMeter(m16){
+    var eighths = m16 / 2;
+    if (eighths !== Math.round(eighths)) return { num: m16, den: 16 };
+    eighths = Math.round(eighths);
+    if (eighths % 3 === 0 && eighths >= 6) return { num: eighths, den: 8 };
+    if (eighths % 2 === 0) return { num: eighths / 2, den: 4 };
+    return { num: eighths, den: 8 };
+  }
+
+  function setMeter(num, den){
+    try {
+      window.midiOptions = window.midiOptions || {};
+      window.midiOptions.timeSignature = [num, den];
+    } catch(_){}
+    var d = el('timeSignatureDisplay');
+    if (d){
+      var t = 'Time Signature: ' + num + '/' + den;
+      if (d.innerText != null) d.innerText = t; else d.textContent = t;
+    }
+    window.__projectMeter = { num: num, den: den };
+  }
+
+  function askMeter(what, from, to, then){
+    var d = shell('meterConflictDialog', 'Time Signature', true);
+    var body = el('meterConflictDialogBody');
+    body.innerHTML =
+      '<div style="font-size:15px; line-height:1.45; margin-bottom:16px;">' +
+        'The selected ' + what + ' suggests a different time signature. ' +
+        'Do you want to change the Project\'s Time Signature to <b>' + to.num + '/' + to.den + '</b>?' +
+        '<div style="font-size:13px; color:#555; margin-top:8px;">' +
+          'The project is in ' + from.num + '/' + from.den + '. Answer no and the rhythm is laid over ' +
+          'that bar as it stands, keeping the project\'s own unit, barring and resolution.' +
+        '</div>' +
+      '</div>' +
+      '<div style="display:flex; gap:10px;">' +
+        '<button id="meterYes" type="button" style="' + BTN2 + ' flex:1;">YES</button>' +
+        '<button id="meterNo" type="button" style="' + BTN2 + ' flex:1; background-color:#fff; color:#007acc; border:1px solid #007acc;">NO</button>' +
+      '</div>';
+    d.style.display = 'block';
+    el('meterYes').addEventListener('click', function(){ d.style.display = 'none'; then(true); });
+    el('meterNo').addEventListener('click', function(){ d.style.display = 'none'; then(false); });
+  }
+
+  /* the grid a pattern will be built on, once the question is settled */
+  function resolveGrid(what, then){
+    var m = meter(), head = firstFullBar();
+    var have = bar16(head);
+    var want = Math.round((m.num * 16) / (m.den || 4));
+    if (!have || have === want){
+      return then({ bar16: want || have, unit16: Math.max(1, Math.round(16 / (m.den || 4))),
+                    num: m.num, den: m.den, head: head });
+    }
+    var to = deriveMeter(have);
+    askMeter(what, { num:m.num, den:m.den }, to, function(yes){
+      if (yes){
+        setMeter(to.num, to.den);
+        then({ bar16: have, unit16: Math.max(1, Math.round(16 / to.den)),
+               num: to.num, den: to.den, head: head });
+      } else {
+        // the project's own beats, stretched over the bar exactly as it is
+        then({ bar16: have, unit16: Math.max(1, Math.round(have / Math.max(1, m.num))),
+               num: m.num, den: m.den, head: head });
+      }
+    });
+  }
+  window.__resolveDrumGrid = resolveGrid;
+
+  /* FIX_89: writing drums must never move the time signature. Whatever the
+     score was in before the pattern, it is in after it. */
+  function meterSnapshot(){
+    var ts = null;
+    try {
+      if (window.midiOptions && window.midiOptions.timeSignature)
+        ts = window.midiOptions.timeSignature.slice();
+    } catch(_){}
+    var d = el('timeSignatureDisplay');
+    return { ts: ts, text: d ? (d.innerText != null ? d.innerText : d.textContent) : null };
+  }
+  function meterRestore(snap){
+    if (!snap) return;
+    try {
+      if (snap.ts && window.midiOptions) window.midiOptions.timeSignature = snap.ts.slice();
+    } catch(_){}
+    var d = el('timeSignatureDisplay');
+    if (d && snap.text != null){
+      var now = (d.innerText != null) ? d.innerText : d.textContent;
+      if (now !== snap.text){ if (d.innerText != null) d.innerText = snap.text; else d.textContent = snap.text; }
+    }
+  }
+
+  /* FIX_89: the first full bar is the head of the first period. A pickup bar
+     is scanned for and stepped over, so the pattern lands on the downbeat of
+     bar 1 instead of starting early inside the anacrusis. */
+  function firstFullBar(){
+    var b2 = bars();
+    if (b2.length && b2[0] && b2[0].pickup) return 1;
+    return 0;
+  }
+  window.__firstFullBar = firstFullBar;
+
+  function applyPattern(style, len, groups, name, grid){
     if (!style) return false;
     if (typeof window.__pushHistory === 'function'){ try { window.__pushHistory(); } catch(_){} }
+    var meterWas = meterSnapshot();
 
     var b = bars();
     if (!b.length) return false;
     var m = meter();
-    var bar16 = barSlots(0) * 2;
-    var unit16 = Math.max(1, Math.round(16 / (m.den || 4)));
-    if (!groups || !groups.length) groups = defaultGroups(m.num || Math.round(bar16 / unit16));
+    var head0 = (grid && grid.head != null) ? grid.head : firstFullBar();
+    var cell = (grid && grid.bar16) ? grid.bar16 : bar16(head0);      // real sixteenths
+    var unit16 = (grid && grid.unit16) ? grid.unit16 : Math.max(1, Math.round(16 / (m.den || 4)));
+    var gnum = (grid && grid.num) ? grid.num : m.num;
+    var gden = (grid && grid.den) ? grid.den : m.den;
+    if (!groups || !groups.length) groups = defaultGroups(gnum || Math.round(cell / unit16), gden);
 
-    var loop = buildLoop(style, len, groups, unit16, bar16);
-    var extraLoop = style.extra ? buildLoop(style.extra, len, groups, unit16, bar16) : null;
+    var loop = buildLoop(style, len, groups, unit16, cell);
+    var extraLoop = style.extra ? buildLoop(style.extra, len, groups, unit16, cell) : null;
 
     ensureStave('Drumset');
     if (extraLoop) ensureStave('Congas');
 
-    var span = selectionSpan();
-    var start = span ? span.from * 2 : 0;                       // in sixteenths
-    var end   = span ? span.to * 2 : totalSlots() * 2;
+    var span = selectionSpan();                                  // already sixteenths
+    var start = span ? span.from : barBase16(head0);
+    var end   = span ? span.to : total16();
     if (end <= start) return false;
 
     function paint(staveName, loopBars){
@@ -16071,9 +16401,9 @@ notes.push(sn);
       var stream = [];
       loopBars.forEach(function(hits){
         var cells = [];
-        for (var z = 0; z < bar16; z++) cells.push([]);
+        for (var z = 0; z < cell; z++) cells.push([]);
         hits.forEach(function(h){
-          if (h[0] < bar16 && cells[h[0]].indexOf(h[1]) < 0) cells[h[0]].push(h[1]);
+          if (h[0] < cell && cells[h[0]].indexOf(h[1]) < 0) cells[h[0]].push(h[1]);
         });
         cells.forEach(function(c){ stream.push(c); });
       });
@@ -16081,7 +16411,7 @@ notes.push(sn);
 
       for (var bi = 0; bi < b.length; bi++){
         try {
-          var base16 = barStart(bi) * 2, n16 = barSlots(bi) * 2;
+          var base16 = barBase16(bi), n16 = bar16(bi);
           var cells = st[staveName][bi];
           if (!cells || cells.length !== n16){
             cells = [];
@@ -16111,9 +16441,13 @@ notes.push(sn);
     window.__drumGroups = groups.slice();
 
     installKit();
+    meterRestore(meterWas);
     try { if (typeof window.renderSheetMusic === 'function') window.renderSheetMusic(); } catch(_){}
     try { if (typeof window.__renderScore === 'function') window.__renderScore(); } catch(_){}
-    try { if (typeof window.__paintSelection === 'function') setTimeout(window.__paintSelection, 0); } catch(_){}
+    setTimeout(function(){
+      meterRestore(meterWas);
+      try { if (typeof window.__paintSelection === 'function') window.__paintSelection(); } catch(_){}
+    }, 0);
     return true;
   }
   window.__applyDrumStyle = applyPattern;
@@ -16128,6 +16462,7 @@ notes.push(sn);
       delete st[name];
     });
     window.__drumNoteMap = {};
+    window.__drumLate = {};
     window.__drumPatternName = null;
     try { if (typeof window.renderSheetMusic === 'function') window.renderSheetMusic(); } catch(_){}
   };
@@ -16190,15 +16525,15 @@ notes.push(sn);
   }
 
   // "into groups of how many rhythmic units do you want to divide 11?"
-  function askGroups(styleName, num, then){
+  function askGroups(styleName, num, den, then){
     var d = shell('drumGroupDialog', 'Rhythmic groups - ' + styleName, true);
     var body = el('drumGroupDialogBody');
     var def = (window.__drumGroups && window.__drumGroups.reduce(function(a,b){ return a+b; }, 0) === num)
-              ? window.__drumGroups : defaultGroups(num);
+              ? window.__drumGroups : defaultGroups(num, den);
     body.innerHTML =
       '<div style="font-size:14px; color:#444; margin-bottom:10px;">' +
         'The bar has <b>' + num + '</b> rhythmic units. Into groups of how many units do you want to divide ' + num + '?' +
-        '<br>Write them separated by commas, e.g. ' + defaultGroups(num).join(',') + '.</div>' +
+        '<br>Write them separated by commas, e.g. ' + defaultGroups(num, den).join(',') + '.</div>' +
       '<input id="drumGroupInput" type="text" value="' + def.join(',') + '" style="' + FIELD2 + ' width:100%; box-sizing:border-box; margin-bottom:6px;">' +
       '<div id="drumGroupWarn" style="font-size:13px; color:#c00; min-height:18px; margin-bottom:10px;"></div>' +
       '<div style="font-size:13px; color:#444; margin-bottom:12px;">Kick on the head of the first group, ' +
@@ -16221,16 +16556,15 @@ notes.push(sn);
   function startStyle(nm){
     var style = STYLES[nm];
     if (!style) return;
-    var m = meter();
-    var bar16 = barSlots(0) * 2;
-    var unit16 = Math.max(1, Math.round(16 / (m.den || 4)));
-    var units = Math.max(1, Math.round(bar16 / unit16));
-    var needsGroups = style.odd || !(style.cell && style.cell === bar16);
-    function finish(groups){
-      askLength(function(len){ applyPattern(style, len, groups, nm); });
-    }
-    if (needsGroups && units >= 5) askGroups(nm, units, finish);
-    else finish(defaultGroups(units));
+    resolveGrid('pattern', function(grid){
+      var units = Math.max(1, Math.round(grid.bar16 / grid.unit16));
+      var needsGroups = style.odd || !(style.cell && style.cell === grid.bar16);
+      function finish(groups){
+        askLength(function(len){ applyPattern(style, len, groups, nm, grid); });
+      }
+      if (needsGroups && units >= 5) askGroups(nm, units, grid.den, finish);
+      else finish(defaultGroups(units, grid.den));
+    });
   }
 
   var MENU = ['Swing 1','Swing 2','Jazz Waltz','Bossa Nova 1','Bossa Nova 2','8ths Funk','16ths Funk',
@@ -16375,6 +16709,42 @@ notes.push(sn);
   }
   window.__installDrumKit = installKit;
 
+  /* the transport calls this once a slot, with the slot's length in ms */
+  window.__slotHook = function(absSlot, delayMs){
+    var store2 = window.__drumLate || {};
+    if (!store2 || !Object.keys(store2).length) return;
+    var kit = window.__voices && window.__voices[128];
+    if (!kit || !kit.triggerAttackRelease) return;
+
+    // which bar, and how far into it
+    var b = bars(), acc = 0, bar = -1, off = 0;
+    for (var i = 0; i < b.length; i++){
+      var n = barSlots(i);
+      if (absSlot < acc + n){ bar = i; off = absSlot - acc; break; }
+      acc += n;
+    }
+    if (bar < 0) return;
+
+    Object.keys(store2).forEach(function(key){
+      var p = key.split('|');
+      if (parseInt(p[1], 10) !== bar) return;
+      var list = store2[key][off];
+      if (!list || !list.length) return;
+      list.forEach(function(h){
+        var when = Math.max(0, Math.round(delayMs * h.at));
+        setTimeout(function(){
+          try {
+            var piece = PIECES[h.piece];
+            if (!piece) return;
+            var m = piece.midi;
+            var nm = NAMES[((m % 12) + 12) % 12] + (Math.floor(m / 12) - 1);
+            kit.triggerAttackRelease([nm], 0.12);
+          } catch(_){}
+        }, when);
+      });
+    });
+  };
+
   /* ================================================================
      10. EDITING THE DRUM STAFF
      ================================================================ */
@@ -16402,7 +16772,7 @@ notes.push(sn);
       var picked = selectedDrumCells(), items = [];
       picked.forEach(function(p){
         if (p.entry.rest) return;
-        items.push({ stave:p.stave, at16: barStart(p.bar) * 2 + p.entry.at16, pieces: p.entry.pieces.slice() });
+        items.push({ stave:p.stave, at16: barBase16(p.bar) + p.entry.at16, pieces: p.entry.pieces.slice() });
       });
       if (items.length){
         var anchor = Math.min.apply(null, items.map(function(i){ return i.at16; }));
@@ -16423,11 +16793,11 @@ notes.push(sn);
         if (!isDrumStave(sel[i].stave)) continue;
         var m = mapFor(sel[i].stave, sel[i].bar);
         var e = m && m[sel[i].note];
-        var at = e ? (barStart(sel[i].bar) * 2 + e.at16) : (barStart(sel[i].bar) * 2);
+        var at = barBase16(sel[i].bar) + (e ? e.at16 : 0);
         if (target == null || at < target){ target = at; tStave = sel[i].stave; }
       }
       if (target == null){
-        target = (window.__playStartIndex | 0) * 2;
+        target = Math.round((window.__playStartIndex | 0) * slotEighths() * 2);
         tStave = clip.items[0].stave;
       }
       if (typeof window.__pushHistory === 'function'){ try { window.__pushHistory(); } catch(_){} }
@@ -16440,7 +16810,7 @@ notes.push(sn);
         var name = tStave || it.stave;
         var acc = 0, bar = -1, inBar = 0;
         for (var bi = 0; bi < b.length; bi++){
-          var n16 = barSlots(bi) * 2;
+          var n16 = bar16(bi);
           if (abs < acc + n16){ bar = bi; inBar = abs - acc; break; }
           acc += n16;
         }
@@ -16453,9 +16823,9 @@ notes.push(sn);
         var slot = merged[k];
         st[slot.name] = st[slot.name] || {};
         var cells = st[slot.name][slot.bar];
-        if (!cells || cells.length !== barSlots(slot.bar) * 2){
+        if (!cells || cells.length !== bar16(slot.bar)){
           cells = [];
-          for (var z = 0; z < barSlots(slot.bar) * 2; z++) cells.push([]);
+          for (var z = 0; z < bar16(slot.bar); z++) cells.push([]);
           st[slot.name][slot.bar] = cells;
         }
         cells[slot.at] = slot.pieces.slice();
@@ -16522,7 +16892,7 @@ notes.push(sn);
       if (isDrumStave(name)){
         var from = cellsFor(name, bar - 1);
         if (!from) return;
-        var n16 = barSlots(bar) * 2, cells = [];
+        var n16 = bar16(bar), cells = [];
         for (var i = 0; i < n16; i++) cells.push((from[i % from.length] || []).slice());
         var st = store();
         st[name] = st[name] || {};
@@ -16559,35 +16929,151 @@ notes.push(sn);
   /* ================================================================
      12. A double click on empty staff picks that whole system
      ================================================================ */
-  function selectSystem(cx, cy){
+  /* FIX_90: the sheet's own coordinates. The score is drawn into an svg
+     whose displayed size and internal size differ, and the whole drawing may
+     be nudged by the fitter, so the point is mapped through the svg's own
+     matrix - the same way the app's note picker does it. */
+  function toContent(cx, cy){
+    var host = el('sheetMusic');
+    var svg = host ? host.querySelector('svg') : null;
+    if (!svg) return null;
+    try {
+      if (svg.createSVGPoint && svg.getScreenCTM){
+        var p = svg.createSVGPoint();
+        p.x = cx; p.y = cy;
+        var m = svg.getScreenCTM();
+        if (m){
+          var q = p.matrixTransform(m.inverse());
+          return { x: q.x, y: q.y };
+        }
+      }
+    } catch(_){}
+    var r = svg.getBoundingClientRect();
+    var w = parseFloat(svg.getAttribute('width')) || r.width || 1;
+    var h = parseFloat(svg.getAttribute('height')) || r.height || 1;
+    if (!r.width || !r.height) return null;
+    return { x: (cx - r.left) * (w / r.width), y: (cy - r.top) * (h / r.height) };
+  }
+
+  // the measure under the pointer, or the nearest one on the same staff line
+  function measureAt(cx, cy){
     var hit = null;
     try { hit = window.__cellsHit ? window.__cellsHit(cx, cy) : null; } catch(_){}
-    if (!hit){ try { hit = window.__barHit ? window.__barHit(cx, cy) : null; } catch(_){} }
-    if (!hit) return false;
+    if (hit && hit.stave != null) return hit;
+    try { hit = window.__barHit ? window.__barHit(cx, cy) : null; } catch(_){}
+    if (hit && hit.stave != null) return hit;
 
-    // the system is the run of measures drawn on the same line as this bar
-    var boxes = window.__noteBoxes || [];
-    var mine = null;
+    var p = toContent(cx, cy), boxes = window.__noteBoxes || [];
+    if (!p || !boxes.length) return null;
+    var best = null, bestD = Infinity;
     boxes.forEach(function(b){
-      if (b.stave === hit.stave && b.bar === hit.bar && mine == null) mine = b;
+      var cyB = (b.top + b.bottom) / 2;
+      var dy = (p.y < b.top - 40 || p.y > b.bottom + 40) ? Infinity : Math.abs(p.y - cyB);
+      if (!isFinite(dy)) return;
+      var dx = (p.x < b.x) ? (b.x - p.x) : (p.x > b.x + b.w ? p.x - (b.x + b.w) : 0);
+      var d = dy * 4 + dx;
+      if (d < bestD){ bestD = d; best = b; }
     });
-    if (!mine) return false;
+    return best;
+  }
+
+  /* FIX_92: a double click arrives after two ordinary clicks, and the sheet
+     has already selected the bar under the pointer with its own hit test.
+     Rather than hit-testing again - which is what kept missing - the system
+     is grown out of that selection: same staff, same line, every bar on it.
+     The coordinate path is only a fallback for a click that selected
+     nothing. */
+  function rowBars(stave, bar){
+    var boxes = window.__noteBoxes || [], mine = null;
+    for (var i = 0; i < boxes.length; i++){
+      if (boxes[i].stave === stave && boxes[i].bar === bar){ mine = boxes[i]; break; }
+    }
+    if (!mine) return [bar];
     var band = [];
-    boxes.forEach(function(b){
-      if (b.stave !== hit.stave) return;
-      if (Math.abs(b.top - mine.top) > 4) return;         // same line only
-      if (band.indexOf(b.bar) < 0) band.push(b.bar);
+    boxes.forEach(function(bx){
+      if (bx.stave !== stave) return;
+      if (Math.abs(bx.top - mine.top) > 4) return;          // the same line only
+      if (band.indexOf(bx.bar) < 0) band.push(bx.bar);
     });
-    if (!band.length) return false;
+    return band.length ? band : [bar];
+  }
 
-    var out = [];
+  function selectSystem(cx, cy){
+    var stave = null, bar = null;
+
+    var sel = window.__selection || [];
+    if (sel.length){                       // the click before this one landed
+      stave = sel[0].stave; bar = sel[0].bar;
+      for (var i = 1; i < sel.length; i++){
+        if (sel[i].stave === stave && sel[i].bar < bar) bar = sel[i].bar;
+      }
+    }
+    if (stave == null && cx != null){
+      var hit = measureAt(cx, cy);
+      if (hit){ stave = hit.stave; bar = hit.bar; }
+    }
+    if (stave == null) return false;
+
+    var band = rowBars(stave, bar), out = [];
     (window.__noteIndex || []).forEach(function(e){
-      if (e.stave === hit.stave && band.indexOf(e.bar) >= 0) out.push({ stave:e.stave, bar:e.bar, note:e.note });
+      if (e.stave === stave && band.indexOf(e.bar) >= 0){
+        out.push({ stave:e.stave, bar:e.bar, note:e.note });
+      }
     });
     if (!out.length) return false;
     window.__selection = out;
     try { if (typeof window.__paintSelection === 'function') window.__paintSelection(); } catch(_){}
     return true;
+  }
+  window.__selectSystemAt = selectSystem;
+
+  /* ================================================================
+     FIX_92: THE SELECTION SURVIVES THE TOOLBAR
+     Harmonize, Transpose, Rhythmize and Drum Pattern all redraw the
+     sheet, and the highlight was drawn onto notes that no longer
+     existed. The selection itself is kept, and repainted once the new
+     drawing is up.
+     ================================================================ */
+  function keepSelection(){
+    if (window.__selKeep) return;
+    window.__selKeep = true;
+
+    var paintSoon = function(){
+      if (!(window.__selection || []).length) return;
+      setTimeout(function(){
+        try { if (typeof window.__paintSelection === 'function') window.__paintSelection(); } catch(_){}
+      }, 0);
+    };
+
+    // a click on the toolbar or in a dialog must never clear what is selected
+    document.addEventListener('mousedown', function(e){
+      var host = el('sheetMusic');
+      if (host && e.target && host.contains(e.target)) return;
+      window.__selHold = (window.__selection || []).slice();
+    }, true);
+    document.addEventListener('click', function(e){
+      var host = el('sheetMusic');
+      if (host && e.target && host.contains(e.target)) return;
+      var held = window.__selHold;
+      if (held && held.length && !(window.__selection || []).length){
+        window.__selection = held.slice();
+      }
+      paintSoon();
+    }, true);
+
+    // and after any redraw the highlight goes back on
+    var prev = window.renderSheetMusic;
+    if (typeof prev === 'function' && !prev.__keepsSelection){
+      var h = function(){
+        var r = prev.apply(this, arguments);
+        paintSoon();
+        return r;
+      };
+      h.__keepsSelection = true;
+      h.__fix87 = prev.__fix87;
+      h.__harmonizeHook = true;
+      window.renderSheetMusic = h;
+    }
   }
 
   /* ================================================================
@@ -16595,14 +17081,18 @@ notes.push(sn);
      ================================================================ */
   function wire(){
     wireButton();
-    var host = el('sheetMusic');
-    if (host && !host.__fix87dbl){
-      host.__fix87dbl = true;
-      host.addEventListener('dblclick', function(e){
-        var onNote = e.target && e.target.closest && e.target.closest('g.vf-stavenote');
-        if (onNote) return;
+    /* FIX_90: the sheet host is replaced the first time the score is drawn,
+       which quietly took the old listener with it. It sits on the document
+       now, so it cannot be lost. */
+    if (!window.__fix90Dbl){
+      window.__fix90Dbl = true;
+      var fire = function(e){
+        var host = el('sheetMusic');
+        if (!host || !e.target || !host.contains(e.target)) return;
         if (selectSystem(e.clientX, e.clientY)){ e.preventDefault(); e.stopPropagation(); }
-      }, true);
+      };
+      document.addEventListener('dblclick', fire, true);
+      document.addEventListener('dblclick', fire, false);   // whichever phase survives
     }
     if (!window.__fix87Keys){
       window.__fix87Keys = true;
@@ -16636,10 +17126,1307 @@ notes.push(sn);
       if (typeof od === 'function') window.__deleteSelection = function(){ return drumDelete() || od.apply(this, arguments); };
     }
     installKit();
+    keepSelection();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire);
   else wire();
   [400, 1200, 2500].forEach(function(t){ setTimeout(wire, t); });
+})();
+</script>
+
+<script>
+/* ================================================================
+   FIX_93 - MORE THAN ONE CONVERSION IN A FILE
+
+   The score used to be derived: the bars were cut from whatever the
+   fraction currently said, every time anything redrew. A second
+   conversion therefore could not exist - the digits changed under
+   the whole score at once, the harmonisation was dropped mid-flight,
+   and the render ran twice against two different bar lists. That is
+   the forth-and-back.
+
+   Here the material stops being derived and becomes owned. Each
+   staff holds a MATERIAL: a frozen list of notes on a tick
+   timeline, 48 ticks to a quarter, which divides by 2, 3, 4, 6, 8,
+   12 and 16 so triplets, sixteenths and odd groupings are all whole
+   numbers. Bars are no longer storage - they are a view, computed by
+   walking the timeline against the project's time signature.
+
+   What follows from that:
+     - a new conversion is generated into a chosen staff, and the
+       staves that were already there do not move
+     - a time signature change is a re-barring of the same ticks, so
+       playback cannot change: only where the barlines fall, and
+       which notes get split and tied across them
+     - materials of different lengths are looped to their lowest
+       common multiple, so everything ends together
+   ================================================================ */
+(function(){
+  'use strict';
+
+  var TPQ = 48;                       // ticks in a quarter
+  var T8  = TPQ / 2;                  // an eighth
+  var T16 = TPQ / 4;                  // a sixteenth
+  /* FIX_94: there is no ceiling on the loop any more. A common multiple is
+     whatever the arithmetic says it is. */
+
+  function el(id){ return document.getElementById(id); }
+  function meter(){
+    try { var m = window.getCurrentMeter && window.getCurrentMeter(); if (m && m.num && m.den) return m; } catch(_){}
+    return { num:4, den:4 };
+  }
+  function slotsPerBar(m){ m = m || meter(); return Math.max(1, Math.round(m.num * (8 / m.den))); }
+  function durSlots(d){ return (window.__durSlots ? window.__durSlots(d) : 1) || 1; }
+  function slotsToDurs(n){
+    return (window.__slotsToDurs ? window.__slotsToDurs(n) : (function(){
+      var o = []; while (n-- > 0) o.push('8'); return o;
+    })());
+  }
+  function staveList(){
+    return ((window.__scoreStaves && window.__scoreStaves.length)
+            ? window.__scoreStaves : [{ name:'Piano RH', clef:'treble', program:0 }]);
+  }
+  function isDrumStave(name){
+    return staveList().some(function(s){
+      return s.name === name && (s.clef === 'percussion' || s.name === 'Drumset' || s.name === 'Congas');
+    });
+  }
+
+  /* ================================================================
+     1. CLEARING A STAFF
+     Every store that can hold material for a staff, in one place.
+     ================================================================ */
+  window.__clearStaff = function(name){
+    if (!name) return;
+    if (window.__barOverride){
+      Object.keys(window.__barOverride).forEach(function(k){
+        if (k.split('|')[0] === name) delete window.__barOverride[k];
+      });
+    }
+    ['__noteShift','__deletedNotes','__noteOverride'].forEach(function(store){
+      var s = window[store];
+      if (!s) return;
+      Object.keys(s).forEach(function(k){ if (k.split('|')[0] === name) delete s[k]; });
+    });
+    if (window.__partNotes){
+      delete window.__partNotes[name];
+      if (window.__partNotes.__drumCells) delete window.__partNotes.__drumCells[name];
+    }
+    if (window.__drumNoteMap){
+      Object.keys(window.__drumNoteMap).forEach(function(k){
+        if (k.split('|')[0] === name) delete window.__drumNoteMap[k];
+      });
+    }
+    if (window.__drumLate){
+      Object.keys(window.__drumLate).forEach(function(k){
+        if (k.split('|')[0] === name) delete window.__drumLate[k];
+      });
+    }
+  };
+
+  /* ================================================================
+     2. THE MATERIAL REGISTRY
+     notes are {tick, dur, midis} - dur in ticks, absolute ticks from
+     the start of the material.
+     ================================================================ */
+  window.__materials = window.__materials || [];
+  var nextId = 1;
+
+  function materialFor(staff){
+    for (var i = 0; i < window.__materials.length; i++){
+      if (window.__materials[i].staff === staff) return window.__materials[i];
+    }
+    return null;
+  }
+  window.__materialFor = materialFor;
+
+  function putMaterial(m){
+    var at = window.__materials.indexOf(materialFor(m.staff));
+    if (at >= 0) window.__materials[at] = m; else window.__materials.push(m);
+    return m;
+  }
+
+  /* A material lasts a whole number of bars of ITS OWN metre - a groove whose
+     last stroke falls before the barline still lasts to the barline. That is
+     what makes four bars of 3/4 and three bars of 4/4 the same length, twelve
+     quarters each, and land on each other exactly. */
+  function totalTicks(m){
+    var end = 0;
+    (m.notes || []).forEach(function(n){ if (n.tick + n.dur > end) end = n.tick + n.dur; });
+    var bt = Math.max(1, Math.round(slotsPerBar(m.meter) * T8));
+    return Math.max(bt, Math.ceil(Math.round(end) / bt) * bt);
+  }
+
+  /* ---- reading a staff off the score as it stands ---- */
+  function readStaff(name, bars){
+    var notes = [], tick = 0;
+    for (var b = 0; b < bars.length; b++){
+      var cap = Math.max(1, (bars[b].melody || []).length);
+      var seq = [];
+      try { seq = window.__barSequence(name, b) || []; } catch(_){ seq = []; }
+      var at = 0;
+      seq.forEach(function(n){
+        var w = (n.sl != null) ? n.sl : durSlots(n.dur || '8');
+        if (!n.rest && n.midis && n.midis.length){
+          notes.push({ tick: Math.round((tick + at) * T8), dur: Math.max(T16, Math.round(w * T8)),
+                       midis: n.midis.slice() });
+        }
+        at += w;
+      });
+      tick += cap;
+    }
+    return notes;
+  }
+
+  function readDrums(name, bars){
+    var cells = (window.__partNotes && window.__partNotes.__drumCells && window.__partNotes.__drumCells[name]) || null;
+    if (!cells) return null;
+    var notes = [], tick = 0, se = (typeof window.__slotUnit === 'number' && window.__slotUnit > 0) ? window.__slotUnit : 1;
+    for (var b = 0; b < bars.length; b++){
+      var cap = Math.max(1, (bars[b].melody || []).length);
+      var row = cells[b];
+      if (row){
+        row.forEach(function(c, i){
+          if (!c || !c.length) return;
+          notes.push({ tick: Math.round(tick * T8 + i * T16), dur: T16, pieces: c.slice() });
+        });
+      }
+      tick += cap * se;
+    }
+    return notes.length ? notes : null;
+  }
+
+  /* ---- freezing everything the file currently holds ---- */
+  function freezeAll(){
+    var bars = [];
+    try { bars = window.__currentBars() || []; } catch(_){}
+    if (!bars.length) return false;
+    var m = meter();
+
+    staveList().forEach(function(st){
+      if (materialFor(st.name)) return;              // already owned
+      if (isDrumStave(st.name)){
+        var dn = readDrums(st.name, bars);
+        if (dn) putMaterial({ id: nextId++, staff: st.name, kind: 'drums', notes: dn,
+                              meter: { num:m.num, den:m.den } });
+        return;
+      }
+      var notes = readStaff(st.name, bars);
+      if (notes.length) putMaterial({ id: nextId++, staff: st.name, kind: 'pitched', notes: notes,
+                                      meter: { num:m.num, den:m.den } });
+    });
+
+    if (!window.__materials.length) return false;
+    window.__multiMaterial = true;
+    return true;
+  }
+  window.__freezeScore = freezeAll;
+
+  /* ---- the live fraction, as a material ---- */
+  function materialFromFraction(){
+    var seq = [];
+    try {
+      var fixed = window.__getFixedModeTokens && window.__getFixedModeTokens();
+      if (fixed && fixed.length && window.__tokenToMidi){
+        seq = fixed.map(function(t){ return window.__tokenToMidi(t); })
+                   .filter(function(x){ return x != null; })
+                   .map(function(m){ return { midi: m }; });
+      }
+    } catch(_){}
+    if (!seq.length){
+      try { seq = window.computeUnifiedMelody() || []; } catch(_){ seq = []; }
+    }
+    if (!seq.length) return null;
+
+    var P = 0;
+    try {
+      var d = window.__currentDigits && window.__currentDigits();
+      if (d && d.periodLength) P = d.periodLength | 0;
+    } catch(_){}
+    var mt = null;
+    try { if (P && window.__meterForPeriodLength) mt = window.__meterForPeriodLength(P); } catch(_){}
+    if (!mt || !mt.num || !mt.den) mt = meter();
+
+    var notes = seq.map(function(o, i){
+      return { tick: i * T8, dur: T8, midis: [o.midi] };
+    });
+    return { id: nextId++, staff: null, kind: 'pitched', notes: notes,
+             meter: { num: mt.num, den: mt.den },
+             source: {
+               num: (el('numerator') || {}).value,
+               den: (el('denominator') || {}).value
+             } };
+  }
+
+  /* ================================================================
+     3. RE-BARRING - the same ticks, a different bar structure
+     Nothing here moves a note in time. It only decides where the
+     barlines fall and splits whatever crosses one, tying the halves,
+     so the playback is note for note what it was.
+     ================================================================ */
+  function rebarPitched(notes, barTicks, barCount){
+    var out = [];                                   // out[bar] = sequence
+    for (var b = 0; b < barCount; b++) out.push([]);
+
+    var pending = notes.slice().sort(function(a, b2){ return a.tick - b2.tick; });
+    var pieces = [];
+    pending.forEach(function(n){
+      var t = n.tick, left = n.dur;
+      while (left > 0){
+        var bar = Math.floor(t / barTicks);
+        if (bar >= barCount) break;
+        var room = (bar + 1) * barTicks - t;
+        var take = Math.min(left, room);
+        pieces.push({ bar: bar, at: t - bar * barTicks, dur: take, midis: n.midis,
+                      tie: (take < left) ? 'start' : null });
+        t += take; left -= take;
+      }
+    });
+
+    pieces.sort(function(a, b2){ return (a.bar - b2.bar) || (a.at - b2.at); });
+    var byBar = {};
+    pieces.forEach(function(p){ (byBar[p.bar] = byBar[p.bar] || []).push(p); });
+
+    for (var b2 = 0; b2 < barCount; b2++){
+      var list = byBar[b2] || [], seq = [], cursor = 0;
+      var cap = Math.round(barTicks / T8);
+      list.forEach(function(p){
+        var start = Math.round(p.at / T8);
+        if (start > cursor){
+          slotsToDurs(start - cursor).forEach(function(d){ seq.push({ rest: true, dur: d }); });
+          cursor = start;
+        }
+        var w = Math.max(1, Math.round(p.dur / T8));
+        if (cursor + w > cap) w = Math.max(1, cap - cursor);
+        var durs = slotsToDurs(w);
+        durs.forEach(function(d, i){
+          seq.push({ midis: p.midis.slice(), dur: d,
+                     tie: (i < durs.length - 1) ? 'start' : (p.tie || null) });
+        });
+        cursor += w;
+      });
+      if (cursor < cap) slotsToDurs(cap - cursor).forEach(function(d){ seq.push({ rest: true, dur: d }); });
+      out[b2] = seq;
+    }
+    return out;
+  }
+
+  function rebarDrums(notes, barTicks, barCount){
+    var per = Math.round(barTicks / T16);
+    var out = [];
+    for (var b = 0; b < barCount; b++){
+      var row = [];
+      for (var i = 0; i < per; i++) row.push([]);
+      out.push(row);
+    }
+    notes.forEach(function(n){
+      var cell = Math.round(n.tick / T16);
+      var bar = Math.floor(cell / per), at = cell % per;
+      if (bar < 0 || bar >= barCount) return;
+      (n.pieces || []).forEach(function(p){
+        if (out[bar][at].indexOf(p) < 0) out[bar][at].push(p);
+      });
+    });
+    return out;
+  }
+
+  /* ================================================================
+     4. THE LOWEST COMMON MULTIPLE
+     Counted in ticks, not beats: re-barring changes how a length is
+     written but never the length itself, so the multiple comes out
+     the same whichever time signature the user settles on.
+     ================================================================ */
+  function gcd(a, b){ a = Math.abs(a); b = Math.abs(b); while (b){ var t = a % b; a = b; b = t; } return a || 1; }
+  function lcm(a, b){ return Math.abs(a / gcd(a, b) * b); }
+
+  function lcmAll(lengths, barTicks){
+    var L = lengths.reduce(function(a, b){ return lcm(a, b); }, lengths[0] || barTicks);
+    window.__lcmTruncated = false;
+    // the score still ends on a barline of the metre it is written in
+    return Math.max(barTicks, Math.ceil(L / barTicks) * barTicks);
+  }
+
+  /* ================================================================
+     5. LAYING THE MATERIALS ONTO THE SCORE
+     ================================================================ */
+  var barCache = null;
+
+  window.__materialBars = function(){
+    if (!window.__multiMaterial || !window.__materials.length) return null;
+    if (barCache) return barCache;
+    layout();
+    return barCache;
+  };
+
+  function layout(){
+    var m = meter();
+    var cap = slotsPerBar(m), barTicks = cap * T8;
+
+    var lens = window.__materials.map(function(mat){ return totalTicks(mat); });
+    var L = lens.length ? lcmAll(lens, barTicks) : barTicks;
+    var barCount = Math.max(1, Math.round(L / barTicks));
+
+    // the bars themselves: capacity carriers, the staves hold the notes
+    var bars = [];
+    for (var b = 0; b < barCount; b++){
+      var mel = [];
+      for (var i = 0; i < cap; i++) mel.push(60);
+      bars.push({ melody: mel, midi: [] });
+    }
+    barCache = bars;
+    window.__materialLoop = {};
+
+    window.__barOverride = window.__barOverride || {};
+    window.__partNotes = window.__partNotes || {};
+
+    var span = barCount * barTicks;
+    window.__materials.forEach(function(mat){
+      var own = totalTicks(mat);
+      /* FIX_94: loop far enough to COVER the score, not to divide it. A
+         rounded-down count was leaving the tail of the last bar empty - the
+         bar of rest that appeared under the new material. */
+      var times = Math.max(1, Math.ceil(span / own));
+      window.__materialLoop[mat.staff] = times;
+
+      // loop the material out to the common ending point
+      var notes = [];
+      for (var k = 0; k < times; k++){
+        mat.notes.forEach(function(n){
+          notes.push({ tick: n.tick + k * own, dur: n.dur, midis: n.midis, pieces: n.pieces });
+        });
+      }
+
+      if (mat.kind === 'drums'){
+        var rows = rebarDrums(notes, barTicks, barCount);
+        window.__partNotes.__drumCells = window.__partNotes.__drumCells || {};
+        window.__partNotes.__drumCells[mat.staff] = {};
+        rows.forEach(function(row, b2){
+          window.__partNotes.__drumCells[mat.staff][b2] = row;
+          if (typeof window.__drumWritePlayback === 'function'){
+            window.__drumWritePlayback(mat.staff, b2, row);
+          }
+        });
+        return;
+      }
+
+      var seqs = rebarPitched(notes, barTicks, barCount);
+      seqs.forEach(function(seq, b3){
+        window.__barOverride[mat.staff + '|' + b3] = seq;
+      });
+    });
+
+    // a staff with nothing of its own rests through the piece
+    staveList().forEach(function(st){
+      if (materialFor(st.name)) return;
+      if (isDrumStave(st.name)) return;
+      for (var b4 = 0; b4 < barCount; b4++){
+        if (window.__barOverride[st.name + '|' + b4]) continue;
+        window.__barOverride[st.name + '|' + b4] =
+          slotsToDurs(cap).map(function(d){ return { rest: true, dur: d }; });
+      }
+    });
+  }
+
+  function relayout(){
+    barCache = null;
+    try { if (typeof window.renderSheetMusic === 'function') window.renderSheetMusic(); } catch(_){}
+    try { if (typeof window.__renderScore === 'function') window.__renderScore(); } catch(_){}
+    try { if (typeof window.__paintSelection === 'function') setTimeout(window.__paintSelection, 0); } catch(_){}
+  }
+  window.__relayoutMaterials = relayout;
+
+  /* ================================================================
+     6. THE DIALOGS
+     ================================================================ */
+  var PANEL = 'border:1px solid #007acc; border-radius:5px; background:#fff; overflow-y:auto;';
+  var BTN   = 'background-color:#007acc; color:#fff; border:none; padding:10px 18px; ' +
+              'border-radius:5px; cursor:pointer; font-size:15px; font-family:inherit;';
+
+  function shell(id, title, wide){
+    var d = el(id);
+    if (d){
+      var t = el(id + 'Title');
+      if (t) t.textContent = title;
+      return d;
+    }
+    d = document.createElement('div');
+    d.id = id;
+    d.style.cssText = 'display:none; position:fixed; left:50%; top:44%; transform:translate(-50%,-50%); ' +
+      'background:#fff; border:1px solid #000; box-shadow:0 6px 20px rgba(0,0,0,.25); z-index:1000003; ' +
+      'padding:18px 22px; font-family:inherit; font-size:16px; color:#111; min-width:' +
+      (wide ? '360px' : '300px') + ';';
+    d.innerHTML = '<button id="' + id + 'Close" class="portable-close-btn" type="button" title="Close" aria-label="Close"></button>' +
+                  '<div id="' + id + 'Title" style="font-weight:bold; margin-bottom:12px;">' + title + '</div>' +
+                  '<div id="' + id + 'Body"></div>';
+    document.body.appendChild(d);
+    var x = el(id + 'Close');
+    if (x) x.addEventListener('click', function(){ d.style.display = 'none'; });
+    try { if (window.__makePortable) window.__makePortable(d); } catch(_){}
+    return d;
+  }
+
+  function askTargetStaff(then){
+    var d = shell('targetStaffDialog', 'Select Target Staff', true);
+    var body = el('targetStaffDialogBody');
+    var names = staveList().map(function(s){ return s.name; });
+    var chosen = names[0];
+
+    body.innerHTML =
+      '<div style="font-size:14px; color:#444; margin-bottom:10px;">' +
+        'Where should the new pattern go? Whatever that staff holds now is replaced.' +
+      '</div>' +
+      '<div id="targetStaffList" style="' + PANEL + ' max-height:260px; margin-bottom:14px;"></div>' +
+      '<button id="targetStaffOk" type="button" style="' + BTN + ' width:100%;">CONVERT ONTO THIS STAFF</button>';
+
+    var box = el('targetStaffList');
+    function draw(){
+      box.innerHTML = '';
+      names.forEach(function(n, i){
+        var r = document.createElement('div');
+        r.style.cssText = 'padding:9px 12px; font-size:15px; cursor:pointer; display:flex; ' +
+                          'align-items:center; gap:9px;' + (i ? ' border-top:1px solid #eee;' : '');
+        var dot = document.createElement('span');
+        dot.textContent = (n === chosen) ? '\u25c9' : '\u25cb';
+        dot.style.cssText = 'color:#007acc; font-size:15px;';
+        var lab = document.createElement('span');
+        lab.textContent = n + (materialFor(n) ? '  (holds music)' : '');
+        r.appendChild(dot); r.appendChild(lab);
+        r.addEventListener('click', function(){ chosen = n; draw(); });   // one only
+        box.appendChild(r);
+      });
+    }
+    draw();
+    d.style.display = 'block';
+    el('targetStaffOk').addEventListener('click', function(){
+      d.style.display = 'none';
+      then(chosen);
+    });
+  }
+
+  function askProjectMeter(from, to, then){
+    var d = shell('convMeterDialog', 'Time Signature', true);
+    var body = el('convMeterDialogBody');
+    body.innerHTML =
+      '<div style="font-size:15px; line-height:1.45; margin-bottom:16px;">' +
+        'The new pattern is in <b>' + to.num + '/' + to.den + '</b>, the project is in <b>' +
+        from.num + '/' + from.den + '</b>. Do you want to change the project time signature?' +
+        '<div style="font-size:13px; color:#555; margin-top:8px;">' +
+          'Yes rewrites the music already on the staves into the new signature. No keeps the ' +
+          'project as it is and fits the new material to it. Either way nothing changes in ' +
+          'the playback - only where the barlines fall, and what has to be tied across them.' +
+        '</div>' +
+      '</div>' +
+      '<div style="display:flex; gap:10px;">' +
+        '<button id="convMeterYes" type="button" style="' + BTN + ' flex:1;">YES</button>' +
+        '<button id="convMeterNo" type="button" style="' + BTN + ' flex:1; background-color:#fff; color:#007acc; border:1px solid #007acc;">NO</button>' +
+      '</div>';
+    d.style.display = 'block';
+    el('convMeterYes').addEventListener('click', function(){ d.style.display = 'none'; then(true); });
+    el('convMeterNo').addEventListener('click', function(){ d.style.display = 'none'; then(false); });
+  }
+
+  function setProjectMeter(num, den){
+    try {
+      window.midiOptions = window.midiOptions || {};
+      window.midiOptions.timeSignature = [num, den];
+    } catch(_){}
+    var d = el('timeSignatureDisplay');
+    if (d){
+      var t = 'Time Signature: ' + num + '/' + den;
+      if (d.innerText != null) d.innerText = t; else d.textContent = t;
+    }
+    window.__projectMeter = { num: num, den: den };
+  }
+
+  /* ================================================================
+     7. THE CONVERSION STATE MACHINE
+     ================================================================ */
+  function hasContent(){
+    if (window.__materials.length) return true;
+    if (window.pitchesToPlay && window.pitchesToPlay.length > 1) return true;
+    if (window.__harmonizeActive && window.__harmonizedChords && window.__harmonizedChords.length) return true;
+    return false;
+  }
+
+  var pending = false;
+
+  function beginSecondConversion(){
+    /* The freeze happens on the click, BEFORE the app recomputes the
+       fraction, so the score on screen never flickers back to a pattern it
+       no longer holds. That flicker was the forth-and-back. */
+    if (!freezeAll()) return false;
+    if (typeof window.__pushHistory === 'function'){ try { window.__pushHistory(); } catch(_){} }
+    pending = true;
+    return true;
+  }
+
+  function finishSecondConversion(){
+    if (!pending) return;
+    pending = false;
+
+    var mat = materialFromFraction();
+    if (!mat){ relayout(); return; }
+
+    askTargetStaff(function(staff){
+      mat.staff = staff;
+      var pm = meter();
+      var different = (mat.meter.num !== pm.num || mat.meter.den !== pm.den);
+
+      function place(){
+        window.__clearStaff(staff);
+        putMaterial(mat);
+        relayout();
+        void ((window.__materialLoop || {})[staff] || 1);
+      }
+
+      if (!different) return place();
+      askProjectMeter(pm, mat.meter, function(yes){
+        if (yes) setProjectMeter(mat.meter.num, mat.meter.den);
+        // either way the layout re-bars everything against the metre that
+        // now stands: the ticks are untouched, only the barring changes
+        place();
+      });
+    });
+  }
+
+  /* the convert menu, caught before the app's own handler */
+  function wireConvert(){
+    if (window.__fix93Convert) return;
+    window.__fix93Convert = true;
+    document.addEventListener('click', function(e){
+      var t = e.target;
+      if (!t || !t.closest) return;
+      var hit = t.closest('#convertRelative,#convertFixed,#convertAbsolute');
+      if (!hit) return;
+      if (!hasContent()) return;                    // the first conversion is as it was
+      if (!beginSecondConversion()) return;
+      // let the app finish computing the new fraction, then ask where it goes
+      setTimeout(finishSecondConversion, 260);
+    }, true);
+  }
+
+  /* ================================================================
+     8. KEEPING THE LAYOUT HONEST
+     ================================================================ */
+  // the drum engine writes its own playback copy; expose it for the layout
+  if (!window.__drumWritePlayback){
+    window.__drumWritePlayback = function(name, bar, cells){
+      var PIECES = window.__drumPieces || {};
+      var slots = Math.max(1, Math.round(cells.length / 2)), out = [];
+      for (var i = 0; i < slots; i++){
+        var midis = [];
+        (cells[i * 2] || []).forEach(function(p){
+          var m = PIECES[p] && PIECES[p].midi;
+          if (m != null && midis.indexOf(m) < 0) midis.push(m);
+        });
+        midis.sort(function(a, b){ return a - b; });
+        out.push(midis.length ? { midis: midis, dur: '8' } : { rest: true, dur: '8' });
+      }
+      window.__barOverride = window.__barOverride || {};
+      window.__barOverride[name + '|' + bar] = out;
+    };
+  }
+
+  // a metre change from anywhere re-bars the materials
+  window.__materialsRebar = function(){ barCache = null; relayout(); };
+
+  // and a fresh start puts the file back to one pattern
+  window.__resetMaterials = function(){
+    (window.__materials || []).forEach(function(m){ window.__clearStaff(m.staff); });
+    window.__materials = [];
+    window.__multiMaterial = false;
+    barCache = null;
+    relayout();
+  };
+
+  window.__materialReport = function(){
+    var m = meter(), cap = slotsPerBar(m), barTicks = cap * T8;
+    return (window.__materials || []).map(function(x){
+      var own = totalTicks(x);
+      return {
+        staff: x.staff, kind: x.kind,
+        metre: x.meter.num + '/' + x.meter.den,
+        ticks: own, bars: own / barTicks,
+        loops: (window.__materialLoop || {})[x.staff] || 1
+      };
+    });
+  };
+
+  function wire(){ wireConvert(); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire);
+  else wire();
+  [400, 1500].forEach(function(t){ setTimeout(wire, t); });
+})();
+</script>
+
+<script>
+/* ================================================================
+   FIX_94 - FILES, RHYTHMIC TRANSFORMATION, ABOUT, LABELS, DRUM LOCK
+
+   A  save and load a whole session as .b12
+   B  augmentation and diminution of the selected material
+   C  the About window
+   D  the labels: Arrange becomes BASS, Extract bass becomes Extract
+      from Piano LH, Create becomes Template, and the BASS menu gains
+      Walking Bass and Paste the pattern
+   E  a drum staff can no longer lose the kit
+   ================================================================ */
+(function(){
+  'use strict';
+
+  function el(id){ return document.getElementById(id); }
+  var BTN = 'background-color:#007acc; color:#fff; border:none; padding:10px 18px; ' +
+            'border-radius:5px; cursor:pointer; font-size:15px; font-family:inherit;';
+  var FIELD = 'padding:8px 10px; border:1px solid #007acc; border-radius:5px; ' +
+              'font-size:16px; color:#111; background:#fff; font-family:inherit;';
+
+  function shell(id, title, wide){
+    var d = el(id);
+    if (d){
+      var t = el(id + 'Title');
+      if (t) t.textContent = title;
+      return d;
+    }
+    d = document.createElement('div');
+    d.id = id;
+    d.style.cssText = 'display:none; position:fixed; left:50%; top:44%; transform:translate(-50%,-50%); ' +
+      'background:#fff; border:1px solid #000; box-shadow:0 6px 20px rgba(0,0,0,.25); z-index:1000004; ' +
+      'padding:18px 22px; font-family:inherit; font-size:16px; color:#111; min-width:' +
+      (wide ? '380px' : '300px') + ';';
+    d.innerHTML = '<button id="' + id + 'Close" class="portable-close-btn" type="button" title="Close" aria-label="Close"></button>' +
+                  '<div id="' + id + 'Title" style="font-weight:bold; margin-bottom:12px;">' + title + '</div>' +
+                  '<div id="' + id + 'Body"></div>';
+    document.body.appendChild(d);
+    var x = el(id + 'Close');
+    if (x) x.addEventListener('click', function(){ d.style.display = 'none'; });
+    try { if (window.__makePortable) window.__makePortable(d); } catch(_){}
+    return d;
+  }
+
+  /* ================================================================
+     E. THE DRUM STAFF KEEPS ITS KIT
+     A staff carries its clef and its sound as plain fields, and every
+     path that rebuilds the list - the instruments dialog, a reorder, a
+     load - copies those fields across. One of them dropping the clef
+     turns a drum staff into a melodic one, and the kit goes with it.
+     Percussion is now pinned on every pass: clef percussion, program
+     128, no matter who wrote the list.
+     ================================================================ */
+  var DRUMS = { 'Drumset':1, 'Congas':1, 'Percussion (misc)':1 };
+
+  function lockPercussion(){
+    var list = window.__scoreStaves;
+    if (!list || !list.length) return;
+    var changed = false;
+    list.forEach(function(s){
+      if (!s) return;
+      var isDrum = DRUMS[s.name] || s.clef === 'percussion' || s.program === 128;
+      if (!isDrum) return;
+      if (s.clef !== 'percussion'){ s.clef = 'percussion'; changed = true; }
+      if (s.program !== 128){ s.program = 128; changed = true; }
+    });
+    if (changed && typeof window.__installDrumKit === 'function'){
+      try { window.__installDrumKit(); } catch(_){}
+    }
+    return changed;
+  }
+  window.__lockPercussion = lockPercussion;
+
+  (function guardStaves(){
+    // before every drawing, and on a slow tick for everything else
+    function hook(){
+      var prev = window.renderSheetMusic;
+      if (typeof prev !== 'function' || prev.__drumLock) return;
+      var h = function(){ lockPercussion(); return prev.apply(this, arguments); };
+      h.__drumLock = true;
+      h.__fix87 = prev.__fix87;
+      h.__keepsSelection = prev.__keepsSelection;
+      h.__harmonizeHook = true;
+      window.renderSheetMusic = h;
+    }
+    hook();
+    [500, 1500, 3000].forEach(function(t){ setTimeout(hook, t); });
+    if (!window.__b12Headless) setInterval(lockPercussion, 1200);
+  })();
+
+  /* ================================================================
+     A. THE .b12 FILE
+     Everything the session is: the fraction, the score, every staff's
+     material, the overlays, the instruments, tempo, volume, metre.
+     ================================================================ */
+  var B12_VERSION = 3;
+
+  function fieldVal(id){ var e = el(id); return e ? e.value : null; }
+
+  function collect(){
+    var doc = {
+      format: 'base12-composer',
+      version: B12_VERSION,
+      saved: new Date().toISOString(),
+
+      fraction: { numerator: fieldVal('numerator'), denominator: fieldVal('denominator') },
+      mode: {
+        altModeActive: !!window.altModeActive,
+        transformSuffix: window.currentTransformSuffix || '',
+        transposeOffset: window.__transposeOffset || 0
+      },
+
+      meter: (window.midiOptions && window.midiOptions.timeSignature)
+             ? window.midiOptions.timeSignature.slice() : [4, 4],
+      tempo: window.currentTempo || 120,
+      volume: window.volume != null ? window.volume : null,
+      slotUnit: window.__slotUnit || 1,
+
+      pitches: {
+        plain: Array.isArray(window.pitchesToPlay) ? window.pitchesToPlay.slice() : [],
+        withOctave: Array.isArray(window.pitchesToPlayWithOctave) ? window.pitchesToPlayWithOctave.slice() : []
+      },
+
+      staves: (window.__scoreStaves || []).map(function(s){
+        return { name: s.name, clef: s.clef, program: s.program };
+      }),
+      instruments: window.__instruments || null,
+
+      materials: (window.__materials || []).map(function(m){
+        return {
+          id: m.id, staff: m.staff, kind: m.kind, meter: m.meter, source: m.source || null,
+          notes: (m.notes || []).map(function(n){
+            return { tick: n.tick, dur: n.dur,
+                     midis: n.midis ? n.midis.slice() : null,
+                     pieces: n.pieces ? n.pieces.slice() : null };
+          })
+        };
+      }),
+      multiMaterial: !!window.__multiMaterial,
+
+      barOverride: window.__barOverride || {},
+      partNotes: window.__partNotes || {},
+      noteShift: window.__noteShift || {},
+      deletedNotes: window.__deletedNotes || {},
+      noteOverride: window.__noteOverride || {},
+
+      harmony: {
+        active: !!window.__harmonizeActive,
+        chords: window.__harmonizedChords || null
+      },
+      drums: {
+        pattern: window.__drumPatternName || null,
+        groups: window.__drumGroups || null,
+        swing: !!window.__drumSwing,
+        late: window.__drumLate || {}
+      },
+      rhythm: {
+        result: window.__rhythmResult || null,
+        applied: window.__rhythmApplied || []
+      }
+    };
+    return JSON.stringify(doc, null, 1);
+  }
+
+  function restore(text){
+    var doc;
+    try { doc = JSON.parse(text); }
+    catch(e){ alert('That file could not be read as a Base 12 Composer project.'); return false; }
+    if (!doc || doc.format !== 'base12-composer'){
+      alert('That file is not a Base 12 Composer project.');
+      return false;
+    }
+    if (typeof window.__pushHistory === 'function'){ try { window.__pushHistory(); } catch(_){} }
+
+    try {
+      if (doc.fraction){
+        if (el('numerator') && doc.fraction.numerator != null) el('numerator').value = doc.fraction.numerator;
+        if (el('denominator') && doc.fraction.denominator != null) el('denominator').value = doc.fraction.denominator;
+      }
+      if (doc.meter && doc.meter.length === 2){
+        window.midiOptions = window.midiOptions || {};
+        window.midiOptions.timeSignature = doc.meter.slice();
+        var d = el('timeSignatureDisplay');
+        if (d){
+          var t = 'Time Signature: ' + doc.meter[0] + '/' + doc.meter[1];
+          if (d.innerText != null) d.innerText = t; else d.textContent = t;
+        }
+      }
+      if (doc.tempo){
+        window.currentTempo = doc.tempo;
+        var tf = el('tempoInput') || el('tempoValue');
+        if (tf && tf.value != null) tf.value = doc.tempo;
+      }
+      if (doc.volume != null){
+        window.volume = doc.volume;
+        if (typeof window.__setMasterVolume === 'function') window.__setMasterVolume(doc.volume);
+      }
+      window.__slotUnit = doc.slotUnit || 1;
+
+      if (doc.mode){
+        window.altModeActive = !!doc.mode.altModeActive;
+        window.currentTransformSuffix = doc.mode.transformSuffix || '';
+        window.__transposeOffset = doc.mode.transposeOffset || 0;
+      }
+      if (doc.pitches){
+        window.pitchesToPlay = doc.pitches.plain || [];
+        window.pitchesToPlayWithOctave = doc.pitches.withOctave || [];
+      }
+
+      window.__scoreStaves = (doc.staves && doc.staves.length)
+        ? doc.staves.map(function(s){ return { name:s.name, clef:s.clef, program:s.program }; })
+        : [{ name:'Piano RH', clef:'treble', program:0 }];
+      window.__instruments = doc.instruments || {};
+
+      window.__materials = (doc.materials || []).map(function(m){ return m; });
+      window.__multiMaterial = !!doc.multiMaterial;
+
+      window.__barOverride  = doc.barOverride  || {};
+      window.__partNotes    = doc.partNotes    || {};
+      window.__noteShift    = doc.noteShift    || {};
+      window.__deletedNotes = doc.deletedNotes || {};
+      window.__noteOverride = doc.noteOverride || {};
+
+      window.__harmonizeActive  = !!(doc.harmony && doc.harmony.active);
+      window.__harmonizedChords = (doc.harmony && doc.harmony.chords) || null;
+
+      if (doc.drums){
+        window.__drumPatternName = doc.drums.pattern || null;
+        window.__drumGroups = doc.drums.groups || null;
+        window.__drumSwing = !!doc.drums.swing;
+        window.__drumLate = doc.drums.late || {};
+      }
+      if (doc.rhythm){
+        window.__rhythmResult = doc.rhythm.result || null;
+        window.__rhythmApplied = doc.rhythm.applied || [];
+      }
+
+      window.__selection = [];
+      lockPercussion();
+      if (typeof window.__installDrumKit === 'function') window.__installDrumKit();
+      if (typeof window.__preloadInstruments === 'function') window.__preloadInstruments();
+      if (typeof window.__relayoutMaterials === 'function') window.__relayoutMaterials();
+      else if (typeof window.renderSheetMusic === 'function') window.renderSheetMusic();
+      return true;
+    } catch(e){
+      console.warn('load failed', e);
+      alert('That project could not be opened.');
+      return false;
+    }
+  }
+
+  /* ---- the dialogs the browser gives us ---- */
+  var handle = null;                  // the file this session is saved to
+  var lastName = 'New file.b12';
+
+  function nativeSave(){ return !!window.showSaveFilePicker; }
+  function nativeOpen(){ return !!window.showOpenFilePicker; }
+  var PICKER = {
+    types: [{ description: 'Base 12 Composer project', accept: { 'application/x-b12': ['.b12'] } }],
+    excludeAcceptAllOption: false
+  };
+
+  function downloadFallback(text, name){
+    var blob = new Blob([text], { type: 'application/x-b12' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name || lastName;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 400);
+  }
+
+  async function saveAs(){
+    var text = collect();
+    if (nativeSave()){
+      try {
+        var opts = { suggestedName: lastName, startIn: 'desktop' };
+        opts.types = PICKER.types;
+        handle = await window.showSaveFilePicker(opts);
+        var w = await handle.createWritable();
+        await w.write(text);
+        await w.close();
+        lastName = handle.name || lastName;
+        return true;
+      } catch(e){
+        if (e && e.name === 'AbortError') return false;
+        console.warn('save picker failed, falling back', e);
+      }
+    }
+    downloadFallback(text, lastName);
+    return true;
+  }
+
+  async function save(){
+    if (!handle) return saveAs();
+    try {
+      var w = await handle.createWritable();
+      await w.write(collect());
+      await w.close();
+      return true;
+    } catch(e){
+      console.warn('save failed, asking again', e);
+      handle = null;
+      return saveAs();
+    }
+  }
+
+  async function load(){
+    if (nativeOpen()){
+      try {
+        var opts = { startIn: 'desktop', multiple: false };
+        opts.types = PICKER.types;
+        var picked = await window.showOpenFilePicker(opts);
+        var h = picked[0];
+        var f = await h.getFile();
+        var text = await f.text();
+        if (restore(text)){ handle = h; lastName = h.name || lastName; }
+        return true;
+      } catch(e){
+        if (e && e.name === 'AbortError') return false;
+        console.warn('open picker failed, falling back', e);
+      }
+    }
+    var input = el('b12FileInput');
+    if (!input){
+      input = document.createElement('input');
+      input.type = 'file';
+      input.id = 'b12FileInput';
+      input.accept = '.b12,application/x-b12';
+      input.style.display = 'none';
+      document.body.appendChild(input);
+      input.addEventListener('change', function(){
+        var f = input.files && input.files[0];
+        if (!f) return;
+        var r = new FileReader();
+        r.onload = function(){ if (restore(String(r.result))) lastName = f.name; };
+        r.readAsText(f);
+        input.value = '';
+      });
+    }
+    input.click();
+    return true;
+  }
+
+  window.__b12Save   = function(){ save(); };
+  window.__b12SaveAs = function(){ saveAs(); };
+  window.__b12Load   = function(){ load(); };
+  window.__b12Serialize = collect;
+  window.__b12Restore   = restore;
+
+  /* ================================================================
+     C. ABOUT
+     ================================================================ */
+  window.__b12About = function(){
+    var d = shell('aboutDialog', 'About', true);
+    var body = el('aboutDialogBody');
+    body.innerHTML =
+      '<div style="font-size:15px; line-height:1.6;">' +
+        '<div style="font-weight:bold; font-size:17px; margin-bottom:8px;">Base 12 Composer version 3.0.</div>' +
+        '<div>Created by Micha\u0142 Wr\u00f3blewski, A PhD project @UMFC in Warsaw, Poland.</div>' +
+        '<div>Copyright \u00a9 2026 by Micha\u0142 Wr\u00f3blewski.</div>' +
+        '<div style="margin-top:8px;">More info at: ' +
+          '<a href="http://www.michalwroblewski.com" target="_blank" rel="noopener" ' +
+             'style="color:#007acc;">http://www.michalwroblewski.com</a></div>' +
+      '</div>';
+    d.style.display = 'block';
+  };
+
+  /* ================================================================
+     B. AUGMENTATION AND DIMINUTION
+     The material is on a tick timeline, so a rhythmic transformation
+     is arithmetic: the notes under the selection are scaled about the
+     point where the selection starts, and everything after them moves
+     by whatever the scaling gained or lost. Longer material simply
+     needs more bars, and the layout adds them.
+     ================================================================ */
+  var TPQ = 48, T8 = TPQ / 2;
+
+  function slotsPerBar(){
+    var m = { num:4, den:4 };
+    try { var g = window.getCurrentMeter && window.getCurrentMeter(); if (g && g.num) m = g; } catch(_){}
+    return Math.max(1, Math.round(m.num * (8 / m.den)));
+  }
+
+  // the tick window the selection covers, per staff
+  function selectionWindows(){
+    var sel = window.__selection || [], out = {};
+    sel.forEach(function(s){
+      var at = null;
+      try { at = window.__slotOf(s.stave, s.bar, s.note); } catch(_){}
+      if (at == null) return;
+      var w = 1;
+      try {
+        var seq = window.__barSequence(s.stave, s.bar) || [];
+        var n = seq[s.note];
+        if (n) w = (n.sl != null) ? n.sl : (window.__durSlots ? window.__durSlots(n.dur || '8') : 1);
+      } catch(_){}
+      var o = out[s.stave] || (out[s.stave] = { from: Infinity, to: -Infinity });
+      if (at * T8 < o.from) o.from = at * T8;
+      if ((at + w) * T8 > o.to) o.to = (at + w) * T8;
+    });
+    Object.keys(out).forEach(function(k){ if (!isFinite(out[k].from)) delete out[k]; });
+    return out;
+  }
+
+  function scaleMaterial(mat, from, to, factor){
+    var span = to - from, delta = Math.round(span * factor) - span;
+    mat.notes = (mat.notes || []).map(function(n){
+      var t = n.tick, d = n.dur;
+      if (t + d <= from) return n;                                  // before: untouched
+      if (t >= to) return { tick: t + delta, dur: d, midis: n.midis, pieces: n.pieces };
+      var nt = from + Math.round((t - from) * factor);
+      var nd = Math.max(6, Math.round(d * factor));                 // never shorter than a 32nd
+      return { tick: nt, dur: nd, midis: n.midis, pieces: n.pieces };
+    });
+    return mat;
+  }
+
+  function rhythmic(factor, label){
+    if (!isFinite(factor) || factor <= 0) return;
+    if (typeof window.__freezeScore === 'function') window.__freezeScore();
+    if (typeof window.__pushHistory === 'function'){ try { window.__pushHistory(); } catch(_){} }
+
+    var wins = selectionWindows();
+    var mats = window.__materials || [];
+    if (!mats.length){ alert('There is nothing on the staves to ' + label + ' yet.'); return; }
+
+    var touched = 0;
+    mats.forEach(function(m){
+      var w = wins[m.staff];
+      if (!w && Object.keys(wins).length) return;                   // a selection picks its staves
+      var from = w ? w.from : 0;
+      var to   = w ? w.to   : (function(){
+        var end = 0;
+        (m.notes || []).forEach(function(n){ if (n.tick + n.dur > end) end = n.tick + n.dur; });
+        return end;
+      })();
+      if (to <= from) return;
+      scaleMaterial(m, from, to, factor);
+      touched++;
+    });
+    if (!touched) return;
+
+    /* the material may now run past the last barline - the layout counts the
+       bars it needs from the material itself, so they are simply there */
+    if (typeof window.__relayoutMaterials === 'function') window.__relayoutMaterials();
+  }
+
+  function askFactor(title, text, then){
+    var d = shell('rhythmScaleDialog', title, true);
+    var body = el('rhythmScaleDialogBody');
+    body.innerHTML =
+      '<div style="font-size:15px; margin-bottom:12px;">' + text + '</div>' +
+      '<input id="rhythmScaleInput" type="number" min="1" step="1" value="2" style="' + FIELD +
+        ' width:100%; box-sizing:border-box; margin-bottom:8px;">' +
+      '<div style="font-size:13px; color:#555; margin-bottom:14px;">' +
+        'Whatever is selected is transformed; with nothing selected the whole score is.' +
+      '</div>' +
+      '<button id="rhythmScaleOk" type="button" style="' + BTN + ' width:100%;">APPLY</button>';
+    d.style.display = 'block';
+    var inp = el('rhythmScaleInput');
+    inp.focus(); inp.select();
+    function go(){
+      var v = parseFloat(inp.value);
+      if (!isFinite(v) || v <= 0) return;
+      d.style.display = 'none';
+      then(v);
+    }
+    el('rhythmScaleOk').addEventListener('click', go);
+    inp.addEventListener('keydown', function(e){ if (e.key === 'Enter') go(); });
+  }
+
+  window.__augmentation = function(){
+    askFactor('Augmentation', 'Multiply the note durations by', function(v){
+      rhythmic(v, 'augment');
+    });
+  };
+  window.__diminution = function(){
+    askFactor('Diminution', 'Divide the note durations by', function(v){
+      rhythmic(1 / v, 'diminish');
+    });
+  };
+
+  /* ================================================================
+     D. LABELS, AND THE BASS MENU
+     ================================================================ */
+  function walkingBass(){
+    if (typeof window.__freezeScore === 'function') window.__freezeScore();
+    if (typeof window.__pushHistory === 'function'){ try { window.__pushHistory(); } catch(_){} }
+
+    var chords = (window.__harmonizeActive && window.__harmonizedChords) ? window.__harmonizedChords : null;
+    var bars = [];
+    try { bars = window.__currentBars() || []; } catch(_){}
+    if (!bars.length) return;
+
+    // the staff it goes on: a bass staff if there is one, else make one
+    var name = null;
+    (window.__scoreStaves || []).forEach(function(s){
+      if (!name && /bass/i.test(s.name) && s.clef !== 'percussion') name = s.name;
+    });
+    if (!name){
+      name = 'Double Bass';
+      window.__scoreStaves = window.__scoreStaves || [];
+      window.__scoreStaves.push({ name: name, clef: 'bass', program: 32 });
+      if (window.__instruments) window.__instruments[name] = true;
+    }
+    if (typeof window.__clearStaff === 'function') window.__clearStaff(name);
+
+    var notes = [], tick = 0;
+    for (var b = 0; b < bars.length; b++){
+      var cap = Math.max(1, (bars[b].melody || []).length);
+      var beats = Math.max(1, Math.round(cap / 2));            // one step to a quarter
+      var pcs = null;
+
+      if (chords && chords[b] && chords[b].midi && chords[b].midi.length){
+        pcs = chords[b].midi.slice().sort(function(x, y){ return x - y; });
+      } else {
+        // no harmony written: the bar's own notes give the line its pitches
+        var seen = [];
+        (bars[b].melody || []).forEach(function(m){
+          var pc = ((m % 12) + 12) % 12;
+          if (seen.indexOf(pc) < 0) seen.push(pc);
+        });
+        pcs = seen.map(function(pc){ return 36 + pc; });
+      }
+      if (!pcs.length) pcs = [36];
+
+      var root = pcs[0];
+      while (root > 52) root -= 12;
+      while (root < 28) root += 12;
+
+      for (var k = 0; k < beats; k++){
+        var m2;
+        if (k === 0) m2 = root;
+        else if (k === beats - 1){
+          // a step into the next bar's root
+          var nxt = root;
+          if (chords && chords[b + 1] && chords[b + 1].midi && chords[b + 1].midi.length){
+            nxt = chords[b + 1].midi[0];
+            while (nxt > 52) nxt -= 12;
+            while (nxt < 28) nxt += 12;
+          }
+          m2 = nxt + (nxt >= root ? -1 : 1);
+        } else {
+          m2 = pcs[Math.min(k, pcs.length - 1)];
+          while (m2 > 55) m2 -= 12;
+          while (m2 < 28) m2 += 12;
+        }
+        notes.push({ tick: Math.round((tick + k * 2) * T8), dur: 2 * T8, midis: [m2] });
+      }
+      tick += cap;
+    }
+
+    var mt = { num:4, den:4 };
+    try { var g = window.getCurrentMeter && window.getCurrentMeter(); if (g && g.num) mt = { num:g.num, den:g.den }; } catch(_){}
+    window.__materials = (window.__materials || []).filter(function(m){ return m.staff !== name; });
+    window.__materials.push({ id: Date.now(), staff: name, kind: 'pitched', notes: notes, meter: mt });
+    window.__multiMaterial = true;
+    if (typeof window.__relayoutMaterials === 'function') window.__relayoutMaterials();
+  }
+  window.__walkingBass = walkingBass;
+
+  function pastePattern(){
+    // the right hand's pattern, laid on the bass staff an octave or two down
+    if (typeof window.__freezeScore === 'function') window.__freezeScore();
+    var src = null;
+    (window.__materials || []).forEach(function(m){ if (!src && m.staff === 'Piano RH') src = m; });
+    if (!src){ alert('There is no pattern on the Piano RH staff to paste.'); return; }
+
+    var name = null;
+    (window.__scoreStaves || []).forEach(function(s){
+      if (!name && /bass/i.test(s.name) && s.clef !== 'percussion') name = s.name;
+    });
+    if (!name){
+      name = 'Double Bass';
+      window.__scoreStaves.push({ name: name, clef: 'bass', program: 32 });
+      if (window.__instruments) window.__instruments[name] = true;
+    }
+    if (typeof window.__pushHistory === 'function'){ try { window.__pushHistory(); } catch(_){} }
+    if (typeof window.__clearStaff === 'function') window.__clearStaff(name);
+
+    var notes = (src.notes || []).map(function(n){
+      var ms = (n.midis || []).map(function(m){
+        var v = m;
+        while (v > 55) v -= 12;                       // into the bass register
+        while (v < 28) v += 12;
+        return v;
+      });
+      return { tick: n.tick, dur: n.dur, midis: ms };
+    });
+    window.__materials = (window.__materials || []).filter(function(m){ return m.staff !== name; });
+    window.__materials.push({ id: Date.now(), staff: name, kind: 'pitched', notes: notes,
+                              meter: { num: src.meter.num, den: src.meter.den } });
+    window.__multiMaterial = true;
+    if (typeof window.__relayoutMaterials === 'function') window.__relayoutMaterials();
+  }
+  window.__pasteBassPattern = pastePattern;
+
+  function relabel(){
+    var a = el('arrangeButton');
+    if (a && !/BASS/.test(a.textContent)) a.textContent = 'BASS \u25bc';
+    var c = el('createButton');
+    if (c && !/Template/.test(c.textContent)) c.textContent = 'Template \u25bc';
+
+    var menu = el('arrangeMenu');
+    if (menu && !menu.__fix94){
+      var items = [
+        { label: 'Extract from Piano LH', find: /extract/i },
+        { label: 'Walking Bass',          act: walkingBass },
+        { label: 'Paste the pattern',     act: pastePattern }
+      ];
+      // the extract line keeps whatever it was already wired to
+      var existing = Array.prototype.slice.call(menu.children);
+      var extract = null;
+      existing.forEach(function(b){ if (/extract/i.test(b.textContent || '')) extract = b; });
+      if (extract) extract.textContent = 'Extract from Piano LH';
+
+      existing.forEach(function(b){
+        if (b !== extract && /to be defined/i.test(b.textContent || '')) b.remove();
+      });
+
+      items.slice(1).forEach(function(it){
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = it.label;
+        b.style.cssText = 'all:unset; display:block; width:100%; text-align:left; padding:10px 12px; ' +
+          'background:#fff; cursor:pointer; color:#111; border-top:1px solid #eee;';
+        b.addEventListener('click', function(e){
+          e.stopPropagation();
+          menu.style.display = 'none';
+          setTimeout(it.act, 0);
+        });
+        menu.appendChild(b);
+      });
+      menu.__fix94 = true;
+    }
+  }
+
+  /* the Transform dropdown gains the two rhythmic transformations */
+  function extendTransformMenu(){
+    var menu = el('transformMenu');
+    if (!menu || menu.__fix94) return;
+    var style = 'all:unset; display:block; width:100%; text-align:left; padding:10px 12px; ' +
+                'background:#fff; border-top:1px solid #eee; cursor:pointer; color:#111;';
+    [['transformAugmentation','Augmentation', window.__augmentation],
+     ['transformDiminution','Diminution', window.__diminution]].forEach(function(p){
+      if (el(p[0])) return;
+      var b = document.createElement('button');
+      b.type = 'button'; b.id = p[0]; b.textContent = p[1];
+      b.style.cssText = style;
+      b.addEventListener('click', function(e){
+        e.preventDefault(); e.stopPropagation();
+        menu.style.display = 'none';
+        setTimeout(p[2], 0);
+      });
+      menu.appendChild(b);
+    });
+    menu.__fix94 = true;
+  }
+
+  function wire(){
+    lockPercussion();
+    relabel();
+    extendTransformMenu();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire);
+  else wire();
+  [300, 900, 1800, 3000].forEach(function(t){ setTimeout(wire, t); });
 })();
 </script>
