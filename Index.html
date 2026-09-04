@@ -5847,6 +5847,85 @@ notes.push(sn);
 })();
 </script>
 
+
+<script>
+/* =====================================================================
+   CHECK ACCIDENTALS  (COMPOSE > Check accidentals)
+
+   Reads the chord symbols standing over the score and reports three
+   faults, the ones that make a page unreadable:
+
+     1. a symbol rooted on Cb, Fb, E# or B#, or on a double accidental.
+        Those roots belong to keys past the seventh sharp or flat, which
+        this program never chooses. F#7 resolves to Bmaj7, not Cbmaj7.
+
+     2. sharps and flats mixed inside one progression. Sharps stay
+        sharps and flats stay flats; the world only turns over when the
+        alternative would need double accidentals.
+
+     3. a symbol whose root accidental disagrees with the accidentals
+        written into that bar - Bbmaj7 spelled with A# and E#.
+   ===================================================================== */
+(function(){
+  var ODD = { 'Cb':1, 'Fb':1, 'E#':1, 'B#':1 };
+
+  function host(){
+    return document.getElementById('sheetMusic') ||
+           document.querySelector('#sheetHost, .sheet-host, svg');
+  }
+
+  function symbols(){
+    var h = host(); if (!h) return [];
+    var out = [], texts = h.querySelectorAll('text');
+    for (var i = 0; i < texts.length; i++){
+      var t = (texts[i].textContent || '').trim();
+      if (!t) continue;
+      var m = t.match(/^([A-G])(\u266f|\u266d|#|b|\u00d7|\u266d\u266d|##|bb)?/);
+      if (!m) continue;
+      if (t.length > 14) continue;                    // instrument names etc.
+      var acc = (m[2] || '').replace('\u266f','#').replace('\u266d','b')
+                            .replace('\u00d7','##');
+      out.push({ text: t, root: m[1] + acc, acc: acc });
+    }
+    return out;
+  }
+
+  window.__checkAccidentals = function(){
+    var list = symbols(), bad = [], sharps = 0, flats = 0, i;
+
+    for (i = 0; i < list.length; i++){
+      var s = list[i];
+      if (ODD[s.root]) bad.push('Root ' + s.root + ' in "' + s.text +
+        '" - use the enharmonic equivalent.');
+      if (s.acc === '##' || s.acc === 'bb') bad.push('Double accidental root in "' +
+        s.text + '".');
+      if (s.acc === '#') sharps++;
+      if (s.acc === 'b') flats++;
+    }
+
+    var msg = [];
+    msg.push('CHECK ACCIDENTALS');
+    msg.push('');
+    msg.push('Chord symbols read: ' + list.length);
+    if (!list.length){
+      msg.push('');
+      msg.push('Nothing to check - harmonize the pattern first.');
+    } else {
+      msg.push('Sharp roots: ' + sharps + '   Flat roots: ' + flats);
+      if (sharps && flats){
+        msg.push('');
+        msg.push('Mixed sharps and flats in one progression. Keep one world' +
+                 ' unless the alternative needs double accidentals.');
+      }
+      msg.push('');
+      msg.push(bad.length ? ('Faults found: ' + bad.length) : 'No faulty roots found.');
+      for (i = 0; i < bad.length && i < 20; i++) msg.push('  \u2022 ' + bad[i]);
+      if (bad.length > 20) msg.push('  ... and ' + (bad.length - 20) + ' more.');
+    }
+    alert(msg.join('\n'));
+  };
+})();
+</script>
 </body>
 </html>
 
@@ -7237,17 +7316,40 @@ notes.push(sn);
   function accPenalty(sp){
     // A double sharp or flat is a last resort: with the wider chord dictionary
     // a stacked-thirds spelling could otherwise force G to be written F##.
-    var cost = Math.abs(sp.acc) >= 2 ? 6 : Math.abs(sp.acc);
-    if ((sp.letter === 6 && sp.acc > 0) || (sp.letter === 2 && sp.acc > 0) ||
-        (sp.letter === 0 && sp.acc < 0) || (sp.letter === 3 && sp.acc < 0)) cost += 1.5;
+    var cost = Math.abs(sp.acc) >= 2 ? 18 : Math.abs(sp.acc);
+    // B#, E#, Cb and Fb belong to keys past the seventh sharp or flat. Those
+    // keys are never chosen here (A flat major, never G sharp major), so a
+    // note only takes one of these spellings when the stacked thirds of its
+    // own chord leave no other reading.
+    if (isOddSpelling(sp)) cost += 9;
     return cost;
+  }
+
+  // true for B#, E#, Cb, Fb - the four naturals that carry an accidental
+  function isOddSpelling(sp){
+    return (sp.letter === 6 && sp.acc > 0) || (sp.letter === 2 && sp.acc > 0) ||
+           (sp.letter === 0 && sp.acc < 0) || (sp.letter === 3 && sp.acc < 0);
+  }
+
+  /* Chord roots are stricter than ordinary notes. A root names the chord in
+     the symbol, and a symbol reading Cbmaj7 or E#7 is wrong in every tonal
+     context: the twelve roots come from the fifteen usable major keys, and
+     where two spellings exist the one with fewer accidentals wins - A flat,
+     not G sharp. Position on the line of fifths: C=0, G=1 ... F=-1, Bb=-2. */
+  var ROOT_LOF = { 0:0, 1:-5, 2:2, 3:-3, 4:4, 5:-1, 6:6, 7:1, 8:-4, 9:3, 10:-2, 11:5 };
+
+  function rootPenalty(sp){
+    var lof = ((LSEMI[sp.letter] * 7) % 12);   // placeholder, real cost below
+    var c = isOddSpelling(sp) ? 30 : 0;        // Cb / Fb / B# / E# never head a symbol
+    if (Math.abs(sp.acc) >= 2) c += 40;        // no double accidental roots at all
+    return c;
   }
 
   // Chord tones first: root, third, fifth, seventh sit on alternating letters.
   function spellChord(rootPc, iv, lof){
     var best = null, bestCost = Infinity;
     candidates(rootPc, false).forEach(function(rootSp){
-      var spells = [], cost = 0, ok = true;
+      var spells = [], cost = rootPenalty(rootSp), ok = true;
       for (var i = 0; i < iv.length; i++){
         var step = lof ? lof[i] : 2 * i;
         var letter = (rootSp.letter + step) % 7;
@@ -7261,13 +7363,17 @@ notes.push(sn);
       if (ok && cost < bestCost){ bestCost = cost; best = spells; }
     });
     // A rigid stack of thirds can force absurdities (F dim7 wanting E double
-    // flat). When it gets that expensive, spell each tone on its own merits.
-    if (!best || bestCost > 3.5){
+    // flat). When it gets that expensive, spell each tone on its own merits -
+    // but the root keeps the reading the symbol needs.
+    if (!best || bestCost > 12){
       var loose = [], total = 0;
       for (var t = 0; t < iv.length; t++){
         var pc = (rootPc + iv[t]) % 12;
         var cs = candidates(pc, false), pick = cs[0], pcost = Infinity;
-        cs.forEach(function(c){ var v = accPenalty(c); if (v < pcost){ pcost = v; pick = c; } });
+        cs.forEach(function(c){
+          var v = accPenalty(c) + (t === 0 ? rootPenalty(c) : 0);
+          if (v < pcost){ pcost = v; pick = c; }
+        });
         total += pcost;
         loose.push({ pc: pc, sp: pick });
       }
@@ -9158,7 +9264,8 @@ notes.push(sn);
         { label: 'Carnatic Tala',          act: function(){ window.__openRhythm('tala'); } },
         { label: 'Insert Accents',         act: function(){ window.__openRhythm('accents'); } }
       ]},
-      { label: 'Add instruments', act: function(){ if (typeof window.__openInstruments === 'function') window.__openInstruments(); } }
+      { label: 'Add instruments', act: function(){ if (typeof window.__openInstruments === 'function') window.__openInstruments(); } },
+      { label: 'Check accidentals', act: function(){ if (typeof window.__checkAccidentals === 'function') window.__checkAccidentals(); } }
     ]},
     { title: 'VIEW', items: [
       { label: 'Convert',     view: 'convertBox' },
@@ -18428,5 +18535,597 @@ notes.push(sn);
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire);
   else wire();
   [300, 900, 1800, 3000].forEach(function(t){ setTimeout(wire, t); });
+})();
+</script>
+
+
+<script>
+/* ================================================================
+   FIX_95 - SHORTCUTS, BASS EXTRACT, STAFF SELECTION, QUIT, SOUNDS
+
+   1  Transpose shortcut                       (Alt+T, and Cmd/Ctrl+T
+      where the browser lets a page have it)
+   2  BASS > Extract from Piano RH             (-36 semitones, B0 floor)
+   3  Triple click selects a staff everywhere
+   4  F1..F5 shown in VIEW and made live; Cmd/Ctrl+A selects the
+      sheet music only
+   5  FILE > Quit
+   6  'Drum Pattern' becomes 'DRUMS pattern'
+   B1 Double Bass plays the acoustic bass samples, not the electric
+   B2 The drum staff cannot lose its kit
+   ================================================================ */
+(function(){
+  'use strict';
+
+  function el(id){ return document.getElementById(id); }
+
+  function press(id){
+    var b = el(id);
+    if (!b) return false;
+    try {
+      b.dispatchEvent(new MouseEvent('click', { bubbles:true, cancelable:true, view:window }));
+    } catch(_){
+      try { b.click(); } catch(__){ return false; }
+    }
+    return true;
+  }
+
+  function typing(t){
+    return !!(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
+                    t.tagName === 'SELECT' || t.isContentEditable));
+  }
+
+  /* Keep the flags a wrapped function carries, so the other fixes'
+     "have I already hooked this?" tests still read true. */
+  function wrap(name, before, after){
+    var fn = window[name];
+    if (typeof fn !== 'function' || fn.__fix95) return;
+    var h = function(){
+      if (before) try { before(); } catch(_){}
+      var r = fn.apply(this, arguments);
+      if (after) try { after(); } catch(_){}
+      return r;
+    };
+    for (var k in fn){ try { h[k] = fn[k]; } catch(_){} }
+    h.__fix95 = true;
+    window[name] = h;
+  }
+
+  /* ================================================================
+     BUG 1 - DOUBLE BASS IS AN ACOUSTIC BASS
+
+     General MIDI 32 is Acoustic Bass and 33 is Fingered (electric)
+     Bass, but the sample table routed the whole 32-39 block to the
+     electric set, so the Double Bass profile came out of the speakers
+     as an electric bass. Program 32 is seeded with the library's
+     contrabass set before anything can build a voice for it: every
+     path in the player asks for window.__voices[32] first and only
+     builds one when that slot is empty, so this is the only place the
+     decision has to be made. The retry path reads __setName off the
+     voice, so a slow load retries the contrabass too.
+     ================================================================ */
+  var SAMPLE_HOST = 'https://raw.githubusercontent.com/nbrosowsky/tonejs-instruments/master/samples/';
+  var CONTRABASS  = ['Fs1','G1','As1','C2','D2','E2','Fs2','Gs2','A2','E3'];
+  var CONTRABASS_GAIN = -0.44;          /* FIX_91 kept both basses at 60% */
+
+  function masterOut(){
+    if (window.__masterOut) return window.__masterOut;
+    if (!window.Tone) return null;
+    try { window.__masterOut = new Tone.Limiter(-3).toDestination(); }
+    catch(_){
+      try { window.__masterOut = new Tone.Gain(0.9).toDestination(); }
+      catch(__){ window.__masterOut = null; }
+    }
+    return window.__masterOut;
+  }
+
+  function acousticBassVoice(){
+    if (!window.Tone || !Tone.Sampler) return null;
+    var urls = {};
+    CONTRABASS.forEach(function(n){ urls[n.replace('s', '#')] = n + '.mp3'; });
+    var smp;
+    try {
+      smp = new Tone.Sampler({ urls: urls, release: 1, baseUrl: SAMPLE_HOST + 'contrabass/' });
+    } catch(e){
+      console.warn('acoustic bass sampler failed', e);
+      return null;
+    }
+    smp.__isSampler = true;
+    smp.__setName = 'contrabass';
+    smp.__host = 0;
+    smp.__acousticBass = true;
+    try { smp.volume.value = CONTRABASS_GAIN; } catch(_){}
+    var out = masterOut();
+    try { if (out) smp.connect(out); else smp.toDestination(); }
+    catch(_){ try { smp.toDestination(); } catch(__){} }
+    return smp;
+  }
+
+  function seedAcousticBass(){
+    if (!window.Tone) return;
+    window.__voices = window.__voices || {};
+    var v = window.__voices[32];
+    if (v && v.__acousticBass && !v.disposed) return;
+    if (v && !v.__acousticBass){ try { v.dispose(); } catch(_){} }
+    var nv = acousticBassVoice();
+    if (nv) window.__voices[32] = nv;
+  }
+  window.__seedAcousticBass = seedAcousticBass;
+
+  /* ================================================================
+     BUG 2 - THE DRUM STAFF KEEPS ITS KIT
+
+     FIX_94 pinned percussion by name, clef or program, which holds as
+     long as one of the three survives a rebuild. If a rebuild writes a
+     fresh staff record it can drop all three at once, and a drum staff
+     comes back as a melodic one. Every staff that has ever been seen
+     as percussion is now remembered by name, so a staff that lost
+     every marking is still recognised and put back. The lock runs
+     before and after each of the calls that rewrite the score.
+     ================================================================ */
+  var DRUM_NAMES = { 'Drumset':1, 'Congas':1, 'Percussion (misc)':1 };
+
+  function isDrumStaff(s){
+    if (!s) return false;
+    if (DRUM_NAMES[s.name]) return true;
+    if (s.clef === 'percussion') return true;
+    if ((s.program | 0) === 128) return true;
+    return !!(window.__drumRegistry && window.__drumRegistry[s.name]);
+  }
+
+  function lockDrums(){
+    var list = window.__scoreStaves;
+    if (!list || !list.length) return false;
+    if (window.__drumLockBusy) return false;      // __installDrumKit is wrapped too
+    window.__drumLockBusy = true;
+    try { return lockDrumsInner(list); }
+    finally { window.__drumLockBusy = false; }
+  }
+
+  function lockDrumsInner(list){
+    window.__drumRegistry = window.__drumRegistry || {};
+    var changed = false;
+    list.forEach(function(s){
+      if (!isDrumStaff(s)) return;
+      window.__drumRegistry[s.name] = 1;
+      if (s.clef !== 'percussion'){ s.clef = 'percussion'; changed = true; }
+      if ((s.program | 0) !== 128){ s.program = 128; changed = true; }
+    });
+    if (changed && typeof window.__installDrumKit === 'function'){
+      try { window.__installDrumKit(); } catch(_){}
+    }
+    return changed;
+  }
+  window.__lockDrums = lockDrums;
+
+  /* ================================================================
+     THE BASS STAFF
+     ================================================================ */
+  function bassStaffName(){
+    var name = null;
+    (window.__scoreStaves || []).forEach(function(s){
+      if (!name && s && /bass/i.test(s.name) && s.clef !== 'percussion') name = s.name;
+    });
+    if (name) return name;
+    name = 'Double Bass';
+    window.__scoreStaves = window.__scoreStaves || [];
+    window.__scoreStaves.push({ name: name, clef: 'bass', program: 32 });
+    if (window.__instruments) window.__instruments[name] = true;
+    seedAcousticBass();
+    if (typeof window.__preloadInstruments === 'function'){
+      try { window.__preloadInstruments(); } catch(_){}
+    }
+    return name;
+  }
+
+  /* ================================================================
+     FEATURE 2 - EXTRACT FROM PIANO RH
+
+     The right hand's material is copied onto the bass staff three
+     octaves down. A note that lands under B0 (MIDI 23) is carried back
+     up by whole octaves, one at a time, and stops at the first octave
+     that clears the threshold - so nothing is lifted further than it
+     has to be, and the interval relationships inside a chord are the
+     only thing that can change, never the pitch classes.
+     ================================================================ */
+  var B0 = 23;
+
+  function foldAboveB0(midi){
+    var v = midi | 0;
+    v -= 36;                              // three octaves down, exactly
+    while (v < B0) v += 12;               // the fewest octaves back up
+    return v;
+  }
+
+  function extractFromRH(){
+    if (typeof window.__freezeScore === 'function'){
+      try { window.__freezeScore(); } catch(_){}
+    }
+
+    var src = null;
+    (window.__materials || []).forEach(function(m){
+      if (!src && m && m.staff === 'Piano RH') src = m;
+    });
+    if (!src || !(src.notes || []).length){
+      alert('There is no material on the Piano RH staff to extract.');
+      return;
+    }
+
+    var name = bassStaffName();
+    if (typeof window.__pushHistory === 'function'){
+      try { window.__pushHistory(); } catch(_){}
+    }
+    if (typeof window.__clearStaff === 'function'){
+      try { window.__clearStaff(name); } catch(_){}
+    }
+
+    var notes = (src.notes || []).map(function(n){
+      return {
+        tick: n.tick,
+        dur: n.dur,
+        midis: (n.midis || []).map(foldAboveB0)
+      };
+    });
+
+    var mt = src.meter || { num: 4, den: 4 };
+    window.__materials = (window.__materials || []).filter(function(m){ return m.staff !== name; });
+    window.__materials.push({
+      id: Date.now(), staff: name, kind: 'pitched', notes: notes,
+      meter: { num: mt.num, den: mt.den }
+    });
+    window.__multiMaterial = true;
+
+    lockDrums();
+    if (typeof window.__relayoutMaterials === 'function'){
+      try { window.__relayoutMaterials(); } catch(e){ console.warn('extract from RH: relayout failed', e); }
+    }
+  }
+  window.__extractFromPianoRH = extractFromRH;
+
+  function addBassMenuItem(){
+    var menu = el('arrangeMenu');
+    if (!menu || menu.__fix95 || !menu.__fix94) return;   // wait for FIX_94's rebuild
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = 'Extract from Piano RH';
+    b.style.cssText = 'all:unset; display:block; width:100%; text-align:left; padding:10px 12px; ' +
+                      'background:#fff; cursor:pointer; color:#111; border-top:1px solid #eee;';
+    b.addEventListener('click', function(e){
+      e.stopPropagation();
+      menu.style.display = 'none';
+      setTimeout(extractFromRH, 0);
+    });
+
+    var lh = null;
+    Array.prototype.slice.call(menu.children).forEach(function(c){
+      if (/Piano LH/i.test(c.textContent || '')) lh = c;
+    });
+    if (lh && lh.nextSibling) menu.insertBefore(b, lh.nextSibling);
+    else menu.appendChild(b);
+    menu.__fix95 = true;
+  }
+
+  /* ================================================================
+     FEATURE 3 - TRIPLE CLICK TAKES THE WHOLE STAFF
+
+     The double click handler (FIX_92) has already grown the selection
+     out to the system by the time a third click lands, so the staff is
+     read off that selection rather than hit-tested a third time. Only
+     the stave index is kept; every bar on it, in every system, goes
+     into the selection.
+     ================================================================ */
+  function selectWholeStaff(cx, cy){
+    var stave = null;
+    var sel = window.__selection || [];
+    if (sel.length) stave = sel[0].stave;
+
+    if (stave == null && typeof window.__selectSystemAt === 'function'){
+      try { window.__selectSystemAt(cx, cy); } catch(_){}
+      sel = window.__selection || [];
+      if (sel.length) stave = sel[0].stave;
+    }
+    if (stave == null) return false;
+
+    var out = [];
+    (window.__noteIndex || []).forEach(function(en){
+      if (en.stave === stave) out.push({ stave: en.stave, bar: en.bar, note: en.note });
+    });
+    if (!out.length) return false;
+
+    window.__selection = out;
+    try { if (typeof window.__paintSelection === 'function') window.__paintSelection(); } catch(_){}
+    return true;
+  }
+  window.__selectWholeStaffAt = selectWholeStaff;
+
+  function selectAllSheet(){
+    var idx = window.__noteIndex || [];
+    if (!idx.length) return false;
+    window.__selection = idx.map(function(en){
+      return { stave: en.stave, bar: en.bar, note: en.note };
+    });
+    try { if (typeof window.__paintSelection === 'function') window.__paintSelection(); } catch(_){}
+    // and nothing of the page itself is left highlighted
+    try {
+      var s = window.getSelection && window.getSelection();
+      if (s && s.removeAllRanges) s.removeAllRanges();
+    } catch(_){}
+    return true;
+  }
+  window.__selectAllSheet = selectAllSheet;
+
+  /* ================================================================
+     FEATURE 4 - THE VIEW WINDOWS ON F1..F5
+     ================================================================ */
+  var VIEW_KEY = {
+    convertBox:     'F1',
+    transportBox:   'F2',
+    patternBox:     'F3',
+    compositionBox: 'F4',
+    sheetMusic:     'F5'
+  };
+  var KEY_VIEW = {
+    F1: 'convertBox',
+    F2: 'transportBox',
+    F3: 'patternBox',
+    F4: 'compositionBox',
+    F5: 'sheetMusic'
+  };
+
+  function labelViewMenu(){
+    var rows = document.querySelectorAll('.mb-menu .mb-item');
+    var n = 0;
+    Array.prototype.forEach.call(rows, function(r){
+      var v = r.__view;
+      if (!v || !VIEW_KEY[v] || r.__keyTag) return;
+      r.style.paddingRight = '78px';
+      var tag = document.createElement('span');
+      tag.className = 'mb-key';
+      tag.textContent = VIEW_KEY[v];
+      tag.style.cssText = 'position:absolute; right:30px; top:8px; font-size:12px; ' +
+                          'letter-spacing:.5px; color:#6b6b6b;';
+      r.appendChild(tag);
+      r.__keyTag = tag;
+      n++;
+    });
+    return n;
+  }
+
+  function toggleView(id){
+    var win = el(id);
+    if (!win) return false;
+    var on = !(win.style.display !== 'none');    // the menu's own reading
+    if (id === 'sheetMusic' && typeof window.__showSheet === 'function'){
+      try { window.__showSheet(on); } catch(_){ win.style.display = on ? 'inline-block' : 'none'; }
+    } else {
+      win.style.display = on ? 'inline-block' : 'none';
+    }
+    if (typeof window.__refreshViewTicks === 'function'){
+      try { window.__refreshViewTicks(); } catch(_){}
+    }
+    return true;
+  }
+  window.__toggleView = toggleView;
+
+  /* ================================================================
+     FEATURE 5 - QUIT
+     ================================================================ */
+  var BTN95 = 'background-color:#007acc; color:#fff; border:none; padding:10px 20px; ' +
+              'border-radius:5px; cursor:pointer; font-size:15px; font-family:inherit;';
+
+  function ask(question, done){
+    var old = el('quitDialog95');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+
+    var d = document.createElement('div');
+    d.id = 'quitDialog95';
+    d.style.cssText = 'position:fixed; left:50%; top:44%; transform:translate(-50%,-50%); ' +
+      'background:#fff; border:1px solid #000; box-shadow:0 6px 20px rgba(0,0,0,.25); ' +
+      'z-index:1000006; padding:22px 26px; font-family:inherit; font-size:16px; color:#111; ' +
+      'min-width:320px; text-align:center;';
+    d.innerHTML =
+      '<div style="margin-bottom:18px;">' + question + '</div>' +
+      '<div style="display:flex; gap:12px; justify-content:center;">' +
+        '<button type="button" id="quitYes95" style="' + BTN95 + '">Yes</button>' +
+        '<button type="button" id="quitNo95"  style="' + BTN95 + '">No</button>' +
+      '</div>';
+    document.body.appendChild(d);
+
+    function close(){ if (d.parentNode) d.parentNode.removeChild(d); }
+    el('quitYes95').addEventListener('click', function(){ close(); done(true); });
+    el('quitNo95').addEventListener('click',  function(){ close(); done(false); });
+  }
+
+  /* The FILE menu's own save does not report back when it finishes, so
+     Quit does its own round trip through the file picker: that is the
+     only way to know the project really was written before the tab is
+     asked to go. It writes the same text the FILE menu writes. */
+  function saveThen(done){
+    var text = '';
+    try { text = window.__b12Serialize ? window.__b12Serialize() : ''; }
+    catch(e){ console.warn('quit: could not collect the project', e); }
+    if (!text){ done(false); return; }
+
+    if (window.showSaveFilePicker){
+      window.showSaveFilePicker({
+        suggestedName: 'New file.b12',
+        startIn: 'desktop',
+        types: [{ description: 'Base 12 Composer project',
+                  accept: { 'application/x-b12': ['.b12'] } }],
+        excludeAcceptAllOption: false
+      }).then(function(h){
+        return h.createWritable().then(function(w){
+          return w.write(text).then(function(){ return w.close(); });
+        });
+      }).then(function(){ done(true); })
+        .catch(function(e){
+          if (e && e.name === 'AbortError'){ done(false); return; }   // cancelled: stay
+          console.warn('quit: save picker failed, downloading instead', e);
+          download(text); done(true);
+        });
+      return;
+    }
+    download(text);
+    done(true);
+  }
+
+  function download(text){
+    var blob = new Blob([text], { type: 'application/x-b12' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'New file.b12';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 400);
+  }
+
+  /* A tab the person opened themselves cannot be closed by the page it
+     is showing - every browser refuses. The close is attempted, and if
+     the tab is still here a moment later the project is put away and a
+     plain screen says so. */
+  function closeTab(){
+    try { window.open('', '_self'); } catch(_){}
+    try { window.close(); } catch(_){}
+    setTimeout(function(){
+      if (document.hidden) return;
+      farewell();
+    }, 400);
+  }
+
+  function farewell(){
+    var v = document.createElement('div');
+    v.id = 'quitScreen95';
+    v.style.cssText = 'position:fixed; inset:0; background:#edf4fa; z-index:1000010; ' +
+      'display:flex; align-items:center; justify-content:center; text-align:center; ' +
+      'font-family:inherit; font-size:18px; color:#111;';
+    v.innerHTML = '<div><div style="font-weight:bold; margin-bottom:10px;">' +
+                  'Base 12 Composer has closed.</div>' +
+                  '<div style="font-size:15px; color:#444;">' +
+                  'Your browser will not let a page close a tab you opened yourself &mdash; ' +
+                  'you can close this tab now.</div></div>';
+    document.body.appendChild(v);
+  }
+
+  function quit(){
+    ask('Do you want to save your project?', function(yes){
+      if (!yes) return;                       // No: back to the project
+      saveThen(function(saved){
+        if (saved) closeTab();                // cancelled saves stay open
+      });
+    });
+  }
+  window.__b12Quit = quit;
+
+  function wireQuit(){
+    var rows = document.querySelectorAll('.mb-menu .mb-item');
+    Array.prototype.forEach.call(rows, function(r){
+      if (r.__quit95) return;
+      if ((r.textContent || '').trim() !== 'Quit') return;
+      r.__quit95 = true;
+      r.classList.remove('mb-todo');
+      r.addEventListener('click', function(e){
+        e.stopPropagation();
+        document.querySelectorAll('.mb-menu').forEach(function(m){ m.style.display = 'none'; });
+        document.querySelectorAll('#menuBar .mb-title').forEach(function(t){ t.classList.remove('open'); });
+        setTimeout(quit, 0);
+      });
+    });
+  }
+
+  /* ================================================================
+     FEATURE 6 - THE DRUMS LABEL
+     ================================================================ */
+  function relabelDrums(){
+    var b = el('drumPatternButton');
+    if (b && (b.textContent || '').trim() !== 'DRUMS pattern') b.textContent = 'DRUMS pattern';
+    var t = el('drumDialog2Title');
+    if (t && /drum\s*pattern/i.test(t.textContent || '')) t.textContent = 'DRUMS pattern';
+  }
+
+  /* ================================================================
+     KEYS
+
+     Everything runs on capture so the sheet is served before the
+     browser's own handling, and nothing fires while a field has focus.
+     Cmd/Ctrl+T is asked for as specified; Chrome, Edge and Safari keep
+     that one for themselves and will open a tab anyway, so Alt+T does
+     the same job everywhere.
+     ================================================================ */
+  function keys(){
+    if (window.__fix95Keys) return;
+    window.__fix95Keys = true;
+
+    document.addEventListener('keydown', function(e){
+      if (typing(e.target)) return;
+      var k = (e.key || '');
+      var lower = k.toLowerCase();
+
+      // F1..F5: the five windows
+      if (KEY_VIEW[k] && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey){
+        e.preventDefault(); e.stopPropagation();
+        toggleView(KEY_VIEW[k]);
+        return;
+      }
+
+      // Transpose
+      if (lower === 't' && !e.shiftKey && (e.altKey || e.ctrlKey || e.metaKey)){
+        e.preventDefault(); e.stopPropagation();
+        press('transposeButton');
+        return;
+      }
+
+      // Select all, in the sheet music and nowhere else
+      if (lower === 'a' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey){
+        e.preventDefault(); e.stopPropagation();
+        selectAllSheet();
+        return;
+      }
+    }, true);
+
+    // the third click of a triple click
+    if (!window.__fix95Triple){
+      window.__fix95Triple = true;
+      var fire = function(e){
+        if ((e.detail | 0) < 3) return;
+        var host = el('sheetMusic');
+        if (!host || !e.target || !host.contains(e.target)) return;
+        if (selectWholeStaff(e.clientX, e.clientY)){
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      };
+      document.addEventListener('click', fire, true);
+    }
+  }
+
+  /* ================================================================
+     WIRING
+     ================================================================ */
+  function wire(){
+    lockDrums();
+    relabelDrums();
+    addBassMenuItem();
+    labelViewMenu();
+    wireQuit();
+    keys();
+
+    // the score is rewritten by these, so the kit is pinned around each
+    ['__renderScore', '__relayoutMaterials', '__b12Load', '__pasteClipboard',
+     '__installDrumKit', 'renderSheetMusic'].forEach(function(n){
+      wrap(n, lockDrums, lockDrums);
+    });
+
+    // and program 32 is an acoustic bass before any voice is built
+    wrap('__playScore', seedAcousticBass, null);
+    wrap('__preloadInstruments', seedAcousticBass, null);
+    if (window.Tone && window.__voices && window.__voices[32] && !window.__voices[32].__acousticBass){
+      seedAcousticBass();
+    }
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire);
+  else wire();
+  [300, 900, 1800, 3000, 5000].forEach(function(t){ setTimeout(wire, t); });
+  if (!window.__b12Headless) setInterval(function(){ lockDrums(); relabelDrums(); }, 1500);
 })();
 </script>
